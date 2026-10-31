@@ -699,6 +699,28 @@ impl Title {
         }
         folder
     }
+    /// Which title menu `native_title_buttons` is editing.
+    fn title_screen(mode: &Mode) -> &'static str {
+        match mode {
+            Mode::Main => "main",
+            Mode::Select { .. } => "select",
+            Mode::Create { .. } => "create",
+            Mode::Edit { .. } => "edit",
+            Mode::Backup { .. } => "backup",
+            Mode::BackupBeforeUpgrade { .. } => "backup_upgrade",
+            Mode::Delete { .. } => "delete",
+            Mode::Error { .. } => "error",
+            Mode::Multiplayer(_) => "multiplayer",
+            Mode::CreateFlat { .. } => "flat",
+        }
+    }
+    /// Native mods edit the title screen's buttons after they are built.
+    /// `screen` is [`Title::title_screen`]. Remove a button to hide it.
+    /// `enabled`, `label`, `x`, `y` and `w` are what gets drawn and clicked.
+    /// The body stays empty: horizon-mixins only accepts a HEAD hook here.
+    pub(crate) fn native_title_buttons(screen: &str, buttons: &mut Vec<Button>) {
+        let _ = (screen, buttons);
+    }
     fn buttons(&self, w: f32, h: f32) -> Vec<Button> {
         // The game rules draw and press their own.
         if self.rules.borrow().is_some() {
@@ -714,7 +736,7 @@ impl Title {
             id,
             icon: None,
         };
-        match &self.mode {
+        let mut built = match &self.mode {
             Mode::Main => {
                 let cx = (w / 2.0).floor();
                 let y = (h / 4.0).floor() + 48.0;
@@ -976,7 +998,9 @@ impl Title {
                 .into_iter()
                 .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
                 .collect(),
-        }
+        };
+        Self::native_title_buttons(Self::title_screen(&self.mode), &mut built);
+        built
     }
     pub fn draw(
         &self,

@@ -186,6 +186,8 @@ struct Globals {
     crumbling_sprite: [f32; 4],
     /// Framebuffer size, selection stroke width, perspective layering scale.
     outline_params: [f32; 4],
+    /// The Dota map's global light for blocks and entities (`dota_map::globals_light`).
+    dota: [[f32; 4]; 12],
     /// Horizon Extras' dynamic lights: camera-relative position and level (`dynamic_light`).
     dynamic_lights: [[f32; 4]; crate::dynamic_light::MAX],
 }
@@ -563,6 +565,11 @@ pub struct Renderer {
     menu_blur: Option<crate::menu_blur::MenuBlur>,
     pub info: wgpu::AdapterInfo,
     pub suspended: bool,
+    /// Keep drawing while the window is minimized, into `minimized_target`
+    /// at the last window size: an agent driving the game over the control
+    /// socket still gets frames and screenshots.
+    pub draw_minimized: bool,
+    minimized_target: Option<wgpu::Texture>,
     pub drawn_sections: usize,
     /// Last frame's section draws (face ranges and translucent sections),
     /// and the draw calls the backend issued for them.
@@ -870,6 +877,18 @@ fn surface_format(
     .or_else(|| formats.iter().copied().find(|f| !f.is_srgb()))
     .unwrap_or(default)
 }
+fn power_preference() -> wgpu::PowerPreference {
+    static LOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let low = *LOW.get_or_init(|| {
+        std::env::var_os("HORIZON_LOW_POWER").is_some()
+            || std::env::args().any(|a| a == "--integrated-gpu")
+    });
+    if low {
+        wgpu::PowerPreference::LowPower
+    } else {
+        wgpu::PowerPreference::HighPerformance
+    }
+}
 /// Opens a device on the first of `backend_order`'s backends that gives one.
 /// Offscreen rendering needs no surface, so it can use a GPU the window's
 /// display cannot present from (a headless compositor).
@@ -904,7 +923,7 @@ async fn open_device(
         };
         let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference: power_preference(),
                 compatible_surface: surface.as_ref(),
                 force_fallback_adapter: false,
                 ..Default::default()
@@ -1737,6 +1756,16 @@ impl Renderer {
                         multisampled: false,
                     },
                 ),
+                entry(
+                    8,
+                    vf,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(9, vf, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
             ],
         });
         let weather = weather::Weather::new(
@@ -1747,6 +1776,15 @@ impl Renderer {
         );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Atlas"),
+            ..Default::default()
+        });
+        // The Dota map's sun shadow, which players and mobs standing in the shade read.
+        let dota_shadow_view = crate::dota_map::shadow_view(&device);
+        let dota_shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Dota sun shadow sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
         let entity_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1785,6 +1823,14 @@ impl Renderer {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&glint_armor_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&dota_shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&dota_shadow_sampler),
+                },
             ],
         });
         let hand_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1822,6 +1868,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&glint_armor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&dota_shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&dota_shadow_sampler),
                 },
             ],
         });
@@ -2662,6 +2716,8 @@ impl Renderer {
             menu_blur: None,
             info,
             suspended: size.width == 0 || size.height == 0,
+            draw_minimized: false,
+            minimized_target: None,
             drawn_sections: 0,
             section_draws: 0,
             section_draw_calls: 0,
@@ -2826,6 +2882,7 @@ impl Renderer {
         if self.suspended {
             return;
         }
+        self.minimized_target = None;
         self.config.width = width;
         self.config.height = height;
         if let Some(surface) = &self.surface {
@@ -2920,7 +2977,11 @@ impl Renderer {
             self.lod_retiring.remove(&key);
         }
         self.release_section(key);
-        let section = self.upload_mesh(mesh);
+        let section = if crate::dota_map::hides_section(key.1 * 16 + crate::chunk::MIN_Y) {
+            None
+        } else {
+            self.upload_mesh(mesh)
+        };
         self.set_detail(
             key,
             section.is_some() || (mesh.solid.is_empty() && mesh.translucent.is_empty()),
@@ -3545,8 +3606,12 @@ impl Renderer {
         if let Some(flat) = &mut self.flat {
             flat.trim(|page| self.arena.has_page(page));
         }
-        if self.suspended {
+        let minimized = self.suspended && self.draw_minimized;
+        if self.suspended && !minimized {
             return Ok(false);
+        }
+        if minimized && self.minimized_target.is_none() {
+            self.minimized_target = Some(Self::offscreen_target(&self.device, &self.config));
         }
         let started = Instant::now();
         if self.first_frame == FirstFrame::Acquire {
@@ -3555,7 +3620,11 @@ impl Renderer {
             self.first_frame = FirstFrame::Submit;
         }
         let acquire = Instant::now();
-        let acquired = self.surface.as_ref().map(|s| s.get_current_texture());
+        let acquired = if minimized {
+            None
+        } else {
+            self.surface.as_ref().map(|s| s.get_current_texture())
+        };
         self.last_wait = acquire.elapsed();
         let (surface_frame, reconfigure) = match acquired {
             None => (None, false),
@@ -3587,7 +3656,11 @@ impl Renderer {
         let target_texture = match (&surface_frame, &mut self.hdr) {
             (Some(_), Some(hdr)) => hdr.frame(&self.device, size),
             (Some(f), None) => f.texture.clone(),
-            (None, _) => self.offscreen.clone().ok_or("no offscreen target")?,
+            (None, _) => self
+                .offscreen
+                .clone()
+                .or_else(|| self.minimized_target.clone())
+                .ok_or("no offscreen target")?,
         };
         // One command buffer for the frame, after the section copies staged
         // since the last one: Metal commits every command buffer wgpu-core
@@ -3699,6 +3772,14 @@ impl Renderer {
                 frame.glint_ticks,
             ],
             outline_params: outline_params(self.config.width, self.config.height),
+            dota: if frame.title {
+                [[0.0; 4]; 12]
+            } else {
+                crate::dota_map::globals_light(
+                    [frame.camera.x, frame.camera.y, frame.camera.z],
+                    ((frame.sky.sun_angle.to_radians().cos() + 0.1) / 0.4).clamp(0.0, 1.0),
+                )
+            },
             dynamic_lights: {
                 let mut lights = [[0.0; 4]; crate::dynamic_light::MAX];
                 for (to, from) in lights.iter_mut().zip(frame.dynamic_lights) {
@@ -4673,6 +4754,24 @@ impl Renderer {
                     pass.set_pipeline(&self.dark_disc);
                     pass.draw(0..3, 0..1);
                 }
+            }
+            if !frame.title {
+                crate::dota_map::draw(
+                    &self.device,
+                    &self.queue,
+                    &mut pass,
+                    self.config.format.remove_srgb_suffix(),
+                    [
+                        frame.camera.x as f32,
+                        frame.camera.y as f32,
+                        frame.camera.z as f32,
+                    ],
+                    view_proj,
+                    // Day 1, night 0: the sun's height, angle 0 is noon.
+                    ((frame.sky.sun_angle.to_radians().cos() + 0.1) / 0.4).clamp(0.0, 1.0),
+                );
+                pass.set_bind_group(0, &self.group, &[]);
+                pack_frame(&mut pass);
             }
             match self
                 .flat

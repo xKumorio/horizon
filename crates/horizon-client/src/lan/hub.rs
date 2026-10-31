@@ -2381,6 +2381,9 @@ impl Hub {
     /// player is sent back where they were).
     fn collide(&self, i: usize, to: [f64; 3], ctx: &TickCtx) -> (bool, bool) {
         let g = &self.guests[i];
+        if crate::dota_map::loaded() {
+            return (false, false);
+        }
         // noPhysics (spectators) and sleepers move freely.
         let Some(binding) = ctx.collision else {
             return (false, false);

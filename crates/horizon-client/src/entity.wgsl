@@ -20,6 +20,10 @@ struct Globals {
     crumbling_sprite: vec4<f32>,
     // Selection outline parameters (read by terrain.wgsl).
     outline_params: vec4<f32>,
+    // The Dota map's global light (dota_map::globals_light): to-sun dir and exposure (0: off),
+    // sun colour, ambient dir, ambient colour, fill vertical, fill constant, map bounds
+    // (min x, min z, max x, max z), camera position and lowest lit height.
+    dota: array<vec4<f32>, 12>,
     // Horizon Extras' dynamic lights: camera-relative position and level (dynamic_light.rs).
     dynamic_lights: array<vec4<f32>, 16>,
 }
@@ -34,6 +38,9 @@ struct Globals {
 // The armour layers' GlintSampler: vanilla samples enchanted_glint_armor with
 // the same repeating, linearly filtered sampler as the item glint.
 @group(0) @binding(7) var glint_armor_tex: texture_2d<f32>;
+// The Dota map's sun shadow (dota_map::shadow_view), and its matrix in globals.dota[8..12].
+@group(0) @binding(8) var dota_shadow: texture_depth_2d;
+@group(0) @binding(9) var dota_shadow_sampler: sampler_comparison;
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -56,6 +63,45 @@ struct Out {
     @location(11) glint_uv: vec2<f32>,
     // 1 drops the quad's back-facing pixels (Vertex::normal w = 1), like a culling render type.
     @location(12) @interpolate(flat) cull: u32,
+}
+// The Dota map's global light (CalculateDotaGlobalLight, without the sun shadow)
+// for a camera-relative point, as a gamma-space multiplier of what a mid-grey
+// surface gets through Dota's tonemap. Negative where the point is off the map.
+// 1 where the sun reaches the point, 0 in the shade of the map's geometry.
+fn dota_sun_shadow(w: vec3<f32>, n: vec3<f32>) -> f32 {
+    if globals.dota[11].w < 0.5 {
+        return 1.0;
+    }
+    let m = mat4x4<f32>(globals.dota[8], globals.dota[9], globals.dota[10], globals.dota[11]);
+    let p = m * vec4<f32>(w + n * 0.15 + vec3<f32>(0.0, 0.1, 0.0), 1.0);
+    let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || p.z > 1.0 {
+        return 1.0;
+    }
+    let t = 1.0 / 8192.0;
+    var lit = textureSampleCompareLevel(dota_shadow, dota_shadow_sampler, uv, p.z);
+    lit += textureSampleCompareLevel(dota_shadow, dota_shadow_sampler, uv + vec2<f32>(t, 0.0) * 2.0, p.z);
+    lit += textureSampleCompareLevel(dota_shadow, dota_shadow_sampler, uv - vec2<f32>(t, 0.0) * 2.0, p.z);
+    lit += textureSampleCompareLevel(dota_shadow, dota_shadow_sampler, uv + vec2<f32>(0.0, t) * 2.0, p.z);
+    lit += textureSampleCompareLevel(dota_shadow, dota_shadow_sampler, uv - vec2<f32>(0.0, t) * 2.0, p.z);
+    return lit / 5.0;
+}
+
+fn dota_light(pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let w = pos + globals.dota[7].xyz;
+    let b = globals.dota[6];
+    if globals.dota[0].w <= 0.0 || w.x < b.x || w.z < b.y || w.x > b.z || w.z > b.w || w.y < globals.dota[7].w {
+        return vec3(-1.0);
+    }
+    let sun_lit = max(dot(n, globals.dota[0].xyz), 0.0) * dota_sun_shadow(w, n);
+    let light = globals.dota[1].rgb * sun_lit
+        + globals.dota[3].rgb * max(dot(n, globals.dota[2].xyz), 0.0)
+        + (globals.dota[4].rgb * n.y + globals.dota[5].rgb) * (1.0 - sun_lit);
+    let x = max(light * 0.2 * globals.dota[0].w, vec3(0.0)) * 0.6;
+    let mapped = clamp(x * (15.8 * x + 2.12) / (x * (1.2 * x + 5.92) + 1.9), vec3(0.0), vec3(1.0));
+    let encoded = select(1.055 * pow(mapped, vec3(1.0 / 2.4)) - 0.055, mapped * 12.92, mapped <= vec3(0.0031308));
+    // 0.4845: the sRGB encoding of the 0.2 grey the multiplier is relative to.
+    return clamp(encoded / 0.4845, vec3(0.3), vec3(1.0)) * 0.9;
 }
 // Shipped light.glsl; normals are already transformed and RGBA8_SNORM packed.
 fn entity_light(normal: vec3<f32>, nether: bool) -> f32 {
@@ -98,6 +144,15 @@ fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     let unlit = overlay == 2u || overlay == 4u || overlay == 6u || overlay == 9u || overlay == 10u
         || overlay == 11u || overlay == 12u;
     out.light_color = select(lm, vec4(1.0), unlit);
+    // On the Dota map the sky light is Dota's global light; block light stays.
+    let shaded = abs(normal.w) >= 0.5;
+    let dota = dota_light(position, select(vec3(0.0, 1.0, 0.0), normalize(normal.xyz), shaded));
+    let on_map = dota.x >= 0.0 && !unlit;
+    if on_map {
+        let block_only = textureSampleLevel(lightmap, lightmap_sampler,
+            clamp(vec2(l.x, 0.0) / 256.0 + 0.5 / 16.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0)), 0.0);
+        out.light_color = vec4(max(dota, block_only.rgb), 1.0);
+    }
     // Overlay 6 (beacon beams): the light bytes carry the sprite's v range; 11 and 12
     // (cracks): the destroy stage sprite's origin.
     out.wrap = vec2(f32(light.x | (light.y << 8u)), f32(light.z | (light.w << 8u))) / 65535.0;
@@ -107,7 +162,7 @@ fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     // Normal w: 0 keeps the baked colour, +-127 shades by the normal, and a small positive 1
     // keeps the baked colour but culls back faces (entitySolid models such as the decorated pot).
     out.cull = select(0u, 1u, normal.w > 0.0 && normal.w < 0.5);
-    if abs(normal.w) >= 0.5 {
+    if abs(normal.w) >= 0.5 && !on_map {
         c = vec4(c.rgb * entity_light(normal.xyz, globals.time.y != 0.0), c.a);
         back = select(c, vec4(back.rgb * entity_light(-normal.xyz, globals.time.y != 0.0), back.a), normal.w < 0.0);
     }

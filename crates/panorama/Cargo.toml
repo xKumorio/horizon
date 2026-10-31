@@ -1,0 +1,9 @@
+[package]
+name = "panorama"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Loads Dota's Panorama XML and CSS and lays it out"
+
+[dependencies]
+icraft-ui = { path = "../icraft-ui" }

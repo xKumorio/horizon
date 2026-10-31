@@ -183,7 +183,7 @@ where
         max_step: f32,
         on_ground: bool,
     ) -> Result<Vec3> {
-        Ok(resolve_world_movement(
+        let moved = resolve_world_movement(
             self,
             MovementRequest {
                 entity: EntityIdentity(0),
@@ -194,7 +194,8 @@ where
                 on_ground,
                 candidate_budget: 1_000_000,
             },
-        )?)
+        )?;
+        Ok(crate::dota_map::clip_movement(bounds, moved, max_step, on_ground))
     }
 }
 impl SceneCollisions<'_, '_> {
@@ -221,7 +222,7 @@ impl SceneCollisions<'_, '_> {
         on_ground: bool,
         context: CollisionContext<'_>,
     ) -> Result<Vec3> {
-        Ok(resolve_world_movement(
+        let moved = resolve_world_movement(
             self,
             MovementRequest {
                 entity: EntityIdentity(0),
@@ -232,7 +233,8 @@ impl SceneCollisions<'_, '_> {
                 on_ground,
                 candidate_budget: 1_000_000,
             },
-        )?)
+        )?;
+        Ok(crate::dota_map::clip_movement(bounds, moved, max_step, on_ground))
     }
     fn context(&self, bounds: Aabb) -> CollisionContext<'static> {
         let y = bounds.min_position().y;

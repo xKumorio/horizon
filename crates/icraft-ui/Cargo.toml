@@ -1,0 +1,10 @@
+[package]
+name = "icraft-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "I-Craft UI windows: the HTML document the server sends and the client draws"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

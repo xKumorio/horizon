@@ -1779,8 +1779,11 @@ impl MotionWorld<'_, '_, '_> {
     /// `LocalPlayer.move`: the move, then `updateAutoJump` with the float
     /// horizontal displacement.
     pub fn move_self(&mut self, movement: Vec3) -> Result<()> {
+        crate::dota_map::maybe_seat(&mut self.player.position, &mut self.player.velocity);
         let before = self.player.position;
         entity_move::move_entity(self, MoverType::SelfMovement, movement)?;
+        let on_ground = self.player.ground.on_ground;
+        crate::dota_map::guard(&mut self.player.position, &mut self.player.velocity, on_ground);
         let dx = (self.player.position.x - before.x) as f32;
         let dz = (self.player.position.z - before.z) as f32;
         self.update_auto_jump(dx, dz)
@@ -1993,18 +1996,20 @@ impl EntityMoveWorld for MotionWorld<'_, '_, '_> {
     }
     fn collide(&mut self, movement: Vec3) -> Result<Vec3> {
         let max_step = self.player.attribute("minecraft:step_height")? as f32;
-        Ok(world_movement::resolve_world_movement(
+        let bounds = self.player.bounds();
+        let moved = world_movement::resolve_world_movement(
             &mut self.movement_collisions(),
             MovementRequest {
                 entity: EntityIdentity(0),
                 context: self.context(),
-                bounds: self.player.bounds(),
+                bounds,
                 movement,
                 max_step,
                 on_ground: self.player.ground.on_ground,
                 candidate_budget: 1_000_000,
             },
-        )?)
+        )?;
+        Ok(crate::dota_map::clip_movement(bounds, moved, max_step, self.player.ground.on_ground))
     }
     fn fall_distance(&self) -> f64 {
         self.player.fall_distance

@@ -54,6 +54,7 @@ pub struct LanSettings {
 
 pub(super) struct LanHost {
     pub hub: Hub,
+    pub dota: Option<super::dota_server::DotaServer>,
     pub settings: LanSettings,
     pub host_entity: i32,
     /// The host's swings the guests were told of (`Game::swings_started`).
@@ -1164,6 +1165,7 @@ impl Game<'_> {
         self.world.light_log = Some(Default::default());
         self.lan = Some(LanHost {
             hub,
+            dota: super::dota_server::DotaServer::load(&self.options),
             settings: LanSettings { port, ..settings },
             host_entity,
             host_swings: self.swings_started,
@@ -1587,6 +1589,9 @@ impl Game<'_> {
                 }
                 events
             };
+            if self.level_pass.last {
+                self.dota_tick(&mut host);
+            }
             if let Some(state) = &state
                 && host.host_mode != state.game_mode
             {
@@ -1603,6 +1608,7 @@ impl Game<'_> {
                     }
                     HostEvent::Joined(conn) => {
                         self.lan_guest_joined(&mut host, conn, state.as_ref(), entities, spawn);
+                        self.dota_joined(&mut host, conn);
                         if self.options.dedicated.is_some()
                             && let Some(g) = host.hub.guest(conn)
                         {
@@ -1638,6 +1644,7 @@ impl Game<'_> {
                         }
                     }
                     HostEvent::Left(mut guest) => {
+                        self.dota_left(&mut host, guest.conn);
                         // The container they had open loses an opener.
                         if let Some(pos) = guest.menu.as_ref().and_then(|m| m.pos)
                             && !guest.spectator()

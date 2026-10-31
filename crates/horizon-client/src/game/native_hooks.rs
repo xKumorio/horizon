@@ -6,6 +6,9 @@
 //! Horizon's own HUD extras do, and keep a mod's settings where the
 //! WebAssembly mod of the same id kept them.
 //!
+//! API 3 adds `native_title_buttons` in `title.rs`: the title screen's
+//! buttons after they are built. A mod removes, moves or disables them.
+//!
 //! API 2 adds the item panel beside container screens and its recipe pages
 //! (`native_panel_items`, `native_panel_recipes`, `native_panel_event`),
 //! and the game's items and recipes (`native_recipes`,
@@ -35,7 +38,7 @@ use winit::{event::MouseButton, keyboard::KeyCode};
 /// The hook points' API version. The launcher reads this line from the
 /// source it builds; keep its form.
 #[allow(dead_code)]
-pub(crate) const NATIVE_HOOKS_API: u32 = 2;
+pub(crate) const NATIVE_HOOKS_API: u32 = 3;
 
 /// The zoom a native mod asks for (`native_zoom`): the factor (1 is none),
 /// eased through the field of view like the spyglass when `smooth`, and the

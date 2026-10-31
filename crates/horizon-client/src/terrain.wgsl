@@ -22,6 +22,10 @@ struct Globals {
     // Atlas rect of the current destroy stage (read by entity.wgsl).
     crumbling_sprite: vec4<f32>,
     outline_params: vec4<f32>,
+    // The Dota map's global light (dota_map::globals_light): to-sun dir and exposure (0: off),
+    // sun colour, ambient dir, ambient colour, fill vertical, fill constant, map bounds
+    // (min x, min z, max x, max z), camera position and lowest lit height.
+    dota: array<vec4<f32>, 12>,
     // Horizon Extras' dynamic lights: camera-relative position and level (dynamic_light.rs).
     dynamic_lights: array<vec4<f32>, 16>,
 }
@@ -84,6 +88,25 @@ fn dynamic_block_light(pos: vec3<f32>) -> f32 {
     }
     return level * 16.0;
 }
+// The Dota map's global light (CalculateDotaGlobalLight, without the sun shadow)
+// for a camera-relative point, as a gamma-space multiplier of what a mid-grey
+// surface gets through Dota's tonemap. Negative where the point is off the map.
+fn dota_light(pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let w = pos + globals.dota[7].xyz;
+    let b = globals.dota[6];
+    if globals.dota[0].w <= 0.0 || w.x < b.x || w.z < b.y || w.x > b.z || w.z > b.w || w.y < globals.dota[7].w {
+        return vec3(-1.0);
+    }
+    let sun_lit = max(dot(n, globals.dota[0].xyz), 0.0);
+    let light = globals.dota[1].rgb * sun_lit
+        + globals.dota[3].rgb * max(dot(n, globals.dota[2].xyz), 0.0)
+        + (globals.dota[4].rgb * n.y + globals.dota[5].rgb) * (1.0 - sun_lit);
+    let x = max(light * 0.2 * globals.dota[0].w, vec3(0.0)) * 0.6;
+    let mapped = clamp(x * (15.8 * x + 2.12) / (x * (1.2 * x + 5.92) + 1.9), vec3(0.0), vec3(1.0));
+    let encoded = select(1.055 * pow(mapped, vec3(1.0 / 2.4)) - 0.055, mapped * 12.92, mapped <= vec3(0.0031308));
+    // 0.4845: the sRGB encoding of the 0.2 grey the multiplier is relative to.
+    return clamp(encoded / 0.4845, vec3(0.3), vec3(1.0)) * 0.9;
+}
 fn sample_lightmap(sky: f32, block: f32) -> vec4<f32> {
     let uv = vec2(block, sky) * 16.0;
     return textureSampleLevel(lightmap, lightmap_sampler,
@@ -124,6 +147,13 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
     out.layer = layer;
     let block = max(f32(light.y), dynamic_block_light(pos));
     out.color = vec4(color.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, block / 16.0);
+    // On the Dota map the sky light is Dota's global light (the face shade is in
+    // the vertex colour); block light stays.
+    let dota = dota_light(pos, vec3(0.0, 1.0, 0.0));
+    if dota.x >= 0.0 {
+        let block_only = sample_lightmap(0.0, block / 16.0).rgb;
+        out.color = vec4(color.rgb * max(dota, block_only), 1.0);
+    }
     out.emission = 15u - (u32(round(color.a * 255.0)) & 15u);
     out.spherical = length(pos);
     out.cylindrical = max(length(pos.xz), abs(pos.y));

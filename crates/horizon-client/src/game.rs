@@ -88,6 +88,9 @@ mod lan_mobs;
 mod lan_mount_menu;
 mod lan_particles;
 mod lan_pvp;
+mod dota_client;
+mod dota_server;
+mod dota_ui;
 mod lan_quiet;
 mod lan_screen;
 mod lan_stations;
@@ -303,6 +306,8 @@ struct Options {
     dimension: Option<String>,
     /// Options.pauseOnLostFocus off (F3+P), for scripted testing.
     no_pause: bool,
+    dota: bool,
+    dota_hero: Option<String>,
     /// Control socket path (`--control`), for `horizon-ctl`.
     control: Option<PathBuf>,
     /// `HORIZON_SPIKES=MS`: print the timed spans of frames slower than MS.
@@ -370,6 +375,8 @@ impl Options {
             weather: None,
             dimension: None,
             no_pause: false,
+            dota: std::env::var_os("HORIZON_DOTA").is_some(),
+            dota_hero: None,
             control: None,
             offscreen: false,
             window_size: [1280, 720],
@@ -392,7 +399,9 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --background            Open without taking focus or the cursor from the app in front
+  --integrated-gpu        Render on the integrated GPU (keeps the discrete one's video memory free)
+  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -405,6 +414,8 @@ impl Options {
                 "--creative" => o.creative = true,
                 "--test-terrain" => o.test_terrain = true,
                 "--no-pause" => o.no_pause = true,
+                "--background" | "--integrated-gpu" => {}
+                "--dota" => o.dota = true,
                 "--offscreen" => o.offscreen = true,
                 "--control" => o.control = Some(horizon_client::control::default_path()),
                 "--server-thread" => o.server_thread = true,
@@ -416,6 +427,7 @@ impl Options {
                         .next()
                         .ok_or_else(|| format!("missing value after {arg}"))?;
                     match arg.as_str() {
+                        "--dota-hero" => o.dota_hero = Some(value),
                         "--resources" => o.resources = value.into(),
                         "--render-distance" | "--radius" => {
                             o.distance = value.parse()?;
@@ -1485,6 +1497,12 @@ struct Game<'a> {
     cursor_icon: horizon_client::widgets::Cursor,
     captured: bool,
     focused: bool,
+    dota: Option<horizon_dota::wire::Snapshot>,
+    dota_shop: Option<horizon_dota::hud::ShopState>,
+    dota_data: Option<std::sync::Arc<horizon_dota::data::Data>>,
+    dota_pick: Option<(Vec<String>, horizon_dota::hud::PickState)>,
+    dota_ui: std::cell::RefCell<Option<dota_ui::DotaUi>>,
+    dota_ui_failed: std::cell::Cell<bool>,
     /// The keyboard's modifier state (`KeyEvent.modifiers`).
     modifiers: winit::keyboard::ModifiersState,
     /// The window's fullscreen request and reported state.
@@ -2136,8 +2154,37 @@ impl Game<'_> {
         let origin = self.eye_position()?;
         self.clip_ray(origin, view_vector(self.yaw, self.pitch), self.reach())
     }
-    /// The first block outline hit within `reach` along the unit `dir`.
+    /// The first block or Dota-map surface within `reach` along the unit `dir`.
     fn clip_ray(&self, origin: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Hit> {
+        let block = self.clip_blocks(origin, dir, reach);
+        let mesh = horizon_client::dota_map::pick_surface(origin, dir, reach).map(|hit| Hit {
+            pos: hit.pos,
+            face: hit.face,
+            point: hit.point,
+        });
+        match (block, mesh) {
+            (Some(block), Some(mesh)) => {
+                let closer = |hit: &Hit| {
+                    let d = [
+                        hit.point[0] - origin[0],
+                        hit.point[1] - origin[1],
+                        hit.point[2] - origin[2],
+                    ];
+                    d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+                };
+                if closer(&block) <= closer(&mesh) {
+                    Some(block)
+                } else {
+                    Some(mesh)
+                }
+            }
+            (Some(block), None) => Some(block),
+            (None, Some(mesh)) => Some(mesh),
+            (None, None) => None,
+        }
+    }
+    /// The first block outline hit within `reach` along the unit `dir`.
+    fn clip_blocks(&self, origin: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Hit> {
         let mut pos = origin.map(|v| v.floor() as i32);
         let step = dir.map(|d| if d > 0.0 { 1 } else { -1 });
         let delta = dir.map(|d| {
@@ -6050,6 +6097,8 @@ impl Game<'_> {
         let spectator = self.spectator();
         let (wi, hi) = (w as i32, h as i32);
         let show_hud = !self.ui.hide_gui;
+        // The Dota HUD replaces the hotbar, hearts, food and the held item.
+        let dota_hud = self.dota.is_some() || self.dota_pick.is_some();
         // max(Hud.leftHeight, Hud.rightHeight) after the bars: the item name and
         // the action bar sit above it.
         let mut bar_height = 39;
@@ -6073,7 +6122,9 @@ impl Game<'_> {
                 let draws = hud_layout::crosshair(wi, hi, attack, full);
                 hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
-            if spectator {
+            if self.dota.is_some() || self.dota_pick.is_some() {
+                self.draw_dota_hud(&mut batch);
+            } else if spectator {
                 self.draw_spectator_hotbar(&mut batch);
             } else {
                 let partial = self.clock.fraction() as f32;
@@ -6104,7 +6155,9 @@ impl Game<'_> {
                     }
                 }
             }
-            self.draw_effect_icons(&mut batch);
+            if !dota_hud {
+                self.draw_effect_icons(&mut batch);
+            }
             // Hud: the action bar and titles draw over the hotbar (nextStratum).
             self.draw_boss_bars(&mut batch);
             self.draw_extras(&mut batch);
@@ -6123,7 +6176,7 @@ impl Game<'_> {
             );
             use horizon_client::locator_bar::ContextualBar;
             // The mount's hearts (and the jump bar).
-            let vehicle_hearts = if spectator {
+            let vehicle_hearts = if spectator || dota_hud {
                 0
             } else {
                 self.draw_mount_hud(
@@ -6135,7 +6188,7 @@ impl Game<'_> {
             };
             // Without the survival bars only the mount's hearts raise it.
             bar_height = 39 + 10 * ((vehicle_hearts + 9) / 10);
-            if contextual == ContextualBar::Locator {
+            if contextual == ContextualBar::Locator && !dota_hud {
                 let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
                 horizon_client::ui::nine_slice(
                     &mut batch,
@@ -6150,6 +6203,7 @@ impl Game<'_> {
             }
             if !self.creative
                 && !spectator
+                && !dota_hud
                 && let Some(p) = &mut self.player
             {
                 let atlas = &self.gui.atlas;
@@ -6218,11 +6272,11 @@ impl Game<'_> {
                     self.audio.capture = capture;
                 }
             }
-            if contextual == ContextualBar::Locator {
+            if contextual == ContextualBar::Locator && !dota_hud {
                 let draws = self.locator_bar_draws(wi, hi);
                 hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
-            if !spectator {
+            if !spectator && !dota_hud {
                 self.draw_selected_name(&mut batch, bar_height, !self.creative);
             }
         }
@@ -10566,6 +10620,8 @@ impl Game<'_> {
         // GameRenderer.renderItemInHand: F1 hides the hand with the HUD.
         if self.spectator()
             || self.ui.hide_gui
+            || self.dota.is_some()
+            || self.dota_pick.is_some()
             || self.sleeping.is_some()
             || !self.camera_type.first_person()
             || self
@@ -12007,6 +12063,7 @@ impl Game<'_> {
             glint_ticks: self.glint_ticks(),
             clouds: (!title
                 && self.dim == Dim::Overworld
+                && !horizon_client::dota_map::loaded()
                 && horizon_client::clouds::visible(&self.settings.clouds, sky.cloud_color[3]))
             .then(|| self.gui.atlas.sprites.get("horizon/white"))
             .flatten()
@@ -12208,6 +12265,9 @@ impl Game<'_> {
             return Ok(());
         }
         if self.sort_key_press(key) {
+            return Ok(());
+        }
+        if self.dota_key(key) {
             return Ok(());
         }
         if self.remote.is_some() && self.remote_key(key)? {
@@ -12682,6 +12742,13 @@ impl Game<'_> {
         }
     }
 }
+fn background_launch() -> bool {
+    static BACKGROUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BACKGROUND.get_or_init(|| {
+        std::env::var_os("HORIZON_BACKGROUND").is_some()
+            || std::env::args().any(|a| a == "--background")
+    })
+}
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -12693,6 +12760,7 @@ impl ApplicationHandler for Game<'_> {
         self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
         let attributes = Window::default_attributes()
             .with_title("Horizon")
+            .with_active(!background_launch())
             .with_window_icon(horizon_client::window::icon());
         // Wayland names the window by its app id, which the horizon.desktop entry matches.
         #[cfg(target_os = "linux")]
@@ -12723,6 +12791,7 @@ impl ApplicationHandler for Game<'_> {
                 return;
             }
         }
+        self.focused = window.has_focus();
         self.window = Some(window);
         self.apply_settings();
         self.previous = Instant::now();
@@ -13132,6 +13201,9 @@ impl ApplicationHandler for Game<'_> {
                             self.inventory_hotkey(key);
                         }
                         // Neither edge of a bound button is an ordinary slot click.
+                        return Ok(());
+                    }
+                    if self.dota_mouse(button, pressed) {
                         return Ok(());
                     }
                     if pressed && self.sort_mouse_press(button) {
@@ -13731,10 +13803,16 @@ impl ApplicationHandler for Game<'_> {
             event_loop.exit();
             return;
         }
+        // Under the control socket a minimized window keeps drawing offscreen.
+        let controlled = self.control.is_some();
+        if let Some(r) = &mut self.renderer {
+            r.draw_minimized = controlled;
+        }
         if let Some(w) = &self.window {
-            if self.options.offscreen {
+            let minimized = controlled && w.is_minimized().unwrap_or(false);
+            if self.options.offscreen || minimized {
                 // Offscreen frames don't wait for the window to be drawn: an
-                // occluded window (a locked macOS session) gets no redraws.
+                // occluded or minimized window gets no redraws.
                 let id = w.id();
                 self.window_event(event_loop, id, WindowEvent::RedrawRequested);
             } else {
@@ -13881,6 +13959,12 @@ impl<'a> Game<'a> {
             cursor_icon: horizon_client::widgets::Cursor::Arrow,
             captured: false,
             focused: true,
+            dota: None,
+            dota_shop: None,
+            dota_data: None,
+            dota_pick: None,
+            dota_ui: std::cell::RefCell::new(None),
+            dota_ui_failed: std::cell::Cell::new(false),
             modifiers: winit::keyboard::ModifiersState::empty(),
             fullscreen: horizon_client::window::FullscreenState::new(false),
             mouse: MouseLook::default(),
@@ -15177,6 +15261,7 @@ impl Loading {
         self.fullscreen = horizon_client::window::FullscreenState::new(fullscreen);
         let attributes = Window::default_attributes()
             .with_title("Horizon")
+            .with_active(!background_launch())
             .with_window_icon(horizon_client::window::icon());
         // Wayland names the window by its app id, which the horizon.desktop entry matches.
         #[cfg(target_os = "linux")]
@@ -15233,6 +15318,7 @@ impl Loading {
         self.menu.set_root(root, &self.settings);
         self.gui = Some(gui);
         horizon_client::ui_theme::reset_atlas();
+        horizon_client::dota_text::reset_atlas();
         self.apply_menu_settings();
         let Some(window) = self.window.clone() else {
             return;

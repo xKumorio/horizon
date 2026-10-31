@@ -14,6 +14,9 @@ horizon-client-input = { path = "../horizon-client-input" }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
+horizon-dota = { path = "../horizon-dota" }
+icraft-ui = { path = "../icraft-ui" }
+panorama = { path = "../panorama" }
 # The server thread ahead of the workers (MinecraftServer.spin's Thread.setPriority).
 horizon-threads = { path = "../horizon-threads" }
 horizon-hdr = { path = "../horizon-hdr" }

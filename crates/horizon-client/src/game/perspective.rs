@@ -299,7 +299,13 @@ impl Game<'_> {
                 4096,
             )
             .ok()?;
-            (!hit.miss).then_some([hit.hit.location.x, hit.hit.location.y, hit.hit.location.z])
+            let block = (!hit.miss).then_some([hit.hit.location.x, hit.hit.location.y, hit.hit.location.z]);
+            let map = horizon_client::dota_map::clip_segment(from, to);
+            let dist = |p: [f64; 3]| (p[0] - from[0]).powi(2) + (p[1] - from[1]).powi(2) + (p[2] - from[2]).powi(2);
+            match (block, map) {
+                (Some(a), Some(b)) => Some(if dist(a) <= dist(b) { a } else { b }),
+                (a, b) => a.or(b),
+            }
         });
         self.view = view;
         Some((

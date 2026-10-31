@@ -1406,6 +1406,9 @@ impl Game<'_> {
                 self.guest_carried_back(host, gi);
             }
             S::ChatCommand(c) => self.guest_chat_command(host, conn, &c.command),
+            S::CustomPayload(p) if p.channel == horizon_dota::wire::CHANNEL => {
+                self.dota_payload(host, conn, &p.data)
+            }
             S::CustomPayload(p) if p.channel == horizon_protocol::quiet::CHANNEL => {
                 self.guest_quiet_commands(host, conn, &p.data)
             }

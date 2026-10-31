@@ -1762,6 +1762,9 @@ impl Game<'_> {
 
     fn handle_packet(&mut self, packet: C) -> Result<()> {
         match packet {
+            C::CustomPayload(p) if p.channel == horizon_dota::wire::CHANNEL => {
+                self.dota_receive(&p.data);
+            }
             // ClientCommonPacketListenerImpl.handlePing runs on the game
             // thread, after all preceding packets (especially teleports).
             C::Ping(p) => self.send(S::Pong(p)),

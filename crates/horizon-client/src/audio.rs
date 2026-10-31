@@ -165,7 +165,67 @@ pub struct Audio {
     /// any), with or without an audio device, as `heard`.
     pub stopped: std::collections::BTreeMap<String, u32>,
 }
+fn decode_wav(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let (mut format, mut channels, mut rate, mut bits) = (0u16, 0u16, 0u32, 0u16);
+    let mut data: Option<&[u8]> = None;
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = bytes.get(at + 8..(at + 8 + size).min(bytes.len()))?;
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                format = u16::from_le_bytes(body[0..2].try_into().ok()?);
+                channels = u16::from_le_bytes(body[2..4].try_into().ok()?);
+                rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+                bits = u16::from_le_bytes(body[14..16].try_into().ok()?);
+                if format == 0xFFFE && body.len() >= 26 {
+                    format = u16::from_le_bytes(body[24..26].try_into().ok()?);
+                }
+            }
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        at += 8 + size + (size & 1);
+    }
+    let data = data?;
+    if channels == 0 || rate == 0 {
+        return None;
+    }
+    let width = usize::from(bits / 8);
+    if width == 0 {
+        return None;
+    }
+    let sample = |chunk: &[u8]| -> f32 {
+        match (format, bits) {
+            (1, 8) => (f32::from(chunk[0]) - 128.0) / 128.0,
+            (1, 16) => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0,
+            (1, 24) => (i32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]]) >> 8) as f32 / 8_388_608.0,
+            (1, 32) => i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32 / 2_147_483_648.0,
+            (3, 32) => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            _ => 0.0,
+        }
+    };
+    if !matches!((format, bits), (1, 8 | 16 | 24 | 32) | (3, 32)) {
+        return None;
+    }
+    let frame = width * usize::from(channels);
+    let mono = data
+        .chunks_exact(frame)
+        .map(|f| f.chunks_exact(width).map(sample).sum::<f32>() / f32::from(channels))
+        .collect();
+    Some((mono, rate))
+}
+
 fn decode(path: &Path) -> Option<(Vec<f32>, u32)> {
+    if let Ok(bytes) = fs::read(path)
+        && bytes.starts_with(b"RIFF")
+    {
+        return decode_wav(&bytes);
+    }
     use symphonia::core::{
         audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
         meta::MetadataOptions, probe::Hint,
@@ -1082,5 +1142,56 @@ mod tests {
         let mut data = [0.0; 2];
         mix(&mut m, &mut data, 1, 48_000);
         assert_eq!(data, [0.5; 2]);
+    }
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::decode_wav;
+
+    fn wav(format: u16, channels: u16, rate: u32, bits: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&format.to_le_bytes());
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * u32::from(channels) * u32::from(bits / 8)).to_le_bytes());
+        out.extend_from_slice(&(channels * (bits / 8)).to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn a_16_bit_stereo_wav_mixes_down_to_mono() {
+        let mut data = Vec::new();
+        for (l, r) in [(16384i16, 0i16), (-16384, -16384), (0, 0)] {
+            data.extend_from_slice(&l.to_le_bytes());
+            data.extend_from_slice(&r.to_le_bytes());
+        }
+        let (mono, rate) = decode_wav(&wav(1, 2, 44100, 16, &data)).unwrap();
+        assert_eq!(rate, 44100);
+        assert_eq!(mono.len(), 3);
+        assert!((mono[0] - 0.25).abs() < 1e-4);
+        assert!((mono[1] + 0.5).abs() < 1e-4);
+        assert_eq!(mono[2], 0.0);
+    }
+
+    #[test]
+    fn eight_bit_float_and_broken_files_are_handled() {
+        let (mono, _) = decode_wav(&wav(1, 1, 8000, 8, &[128, 255, 0])).unwrap();
+        assert!((mono[1] - 0.9921875).abs() < 1e-4 && (mono[2] + 1.0).abs() < 1e-4);
+        let mut floats = Vec::new();
+        floats.extend_from_slice(&0.5f32.to_le_bytes());
+        let (mono, _) = decode_wav(&wav(3, 1, 48000, 32, &floats)).unwrap();
+        assert_eq!(mono, vec![0.5]);
+        assert!(decode_wav(b"RIFFxxxx").is_none());
+        assert!(decode_wav(&wav(2, 1, 8000, 16, &[0, 0])).is_none());
+        assert!(decode_wav(&wav(1, 0, 8000, 16, &[0, 0])).is_none());
     }
 }

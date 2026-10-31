@@ -329,6 +329,12 @@ impl HudAtlas {
                 vec![0; side * side * 4],
             ));
         }
+        images.push((
+            "horizon/dota-text".into(),
+            2048,
+            2048,
+            vec![0; 2048 * 2048 * 4],
+        ));
         // The on-screen keyboard's text and corner masks (ui_theme), rasterized at run time.
         images.push((
             "horizon/ui-text".into(),
