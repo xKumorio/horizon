@@ -88,9 +88,7 @@ mod lan_mobs;
 mod lan_mount_menu;
 mod lan_particles;
 mod lan_pvp;
-mod dota_client;
 mod dota_server;
-mod dota_ui;
 mod lan_quiet;
 mod lan_screen;
 mod lan_stations;
@@ -1497,12 +1495,6 @@ struct Game<'a> {
     cursor_icon: horizon_client::widgets::Cursor,
     captured: bool,
     focused: bool,
-    dota: Option<horizon_dota::wire::Snapshot>,
-    dota_shop: Option<horizon_dota::hud::ShopState>,
-    dota_data: Option<std::sync::Arc<horizon_dota::data::Data>>,
-    dota_pick: Option<(Vec<String>, horizon_dota::hud::PickState)>,
-    dota_ui: std::cell::RefCell<Option<dota_ui::DotaUi>>,
-    dota_ui_failed: std::cell::Cell<bool>,
     /// The keyboard's modifier state (`KeyEvent.modifiers`).
     modifiers: winit::keyboard::ModifiersState,
     /// The window's fullscreen request and reported state.
@@ -6097,8 +6089,6 @@ impl Game<'_> {
         let spectator = self.spectator();
         let (wi, hi) = (w as i32, h as i32);
         let show_hud = !self.ui.hide_gui;
-        // The Dota HUD replaces the hotbar, hearts, food and the held item.
-        let dota_hud = self.dota.is_some() || self.dota_pick.is_some();
         // max(Hud.leftHeight, Hud.rightHeight) after the bars: the item name and
         // the action bar sit above it.
         let mut bar_height = 39;
@@ -6122,9 +6112,7 @@ impl Game<'_> {
                 let draws = hud_layout::crosshair(wi, hi, attack, full);
                 hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
-            if self.dota.is_some() || self.dota_pick.is_some() {
-                self.draw_dota_hud(&mut batch);
-            } else if spectator {
+            if spectator {
                 self.draw_spectator_hotbar(&mut batch);
             } else {
                 let partial = self.clock.fraction() as f32;
@@ -6155,9 +6143,7 @@ impl Game<'_> {
                     }
                 }
             }
-            if !dota_hud {
-                self.draw_effect_icons(&mut batch);
-            }
+            self.draw_effect_icons(&mut batch);
             // Hud: the action bar and titles draw over the hotbar (nextStratum).
             self.draw_boss_bars(&mut batch);
             self.draw_extras(&mut batch);
@@ -6176,7 +6162,7 @@ impl Game<'_> {
             );
             use horizon_client::locator_bar::ContextualBar;
             // The mount's hearts (and the jump bar).
-            let vehicle_hearts = if spectator || dota_hud {
+            let vehicle_hearts = if spectator {
                 0
             } else {
                 self.draw_mount_hud(
@@ -6188,7 +6174,7 @@ impl Game<'_> {
             };
             // Without the survival bars only the mount's hearts raise it.
             bar_height = 39 + 10 * ((vehicle_hearts + 9) / 10);
-            if contextual == ContextualBar::Locator && !dota_hud {
+            if contextual == ContextualBar::Locator {
                 let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
                 horizon_client::ui::nine_slice(
                     &mut batch,
@@ -6203,7 +6189,6 @@ impl Game<'_> {
             }
             if !self.creative
                 && !spectator
-                && !dota_hud
                 && let Some(p) = &mut self.player
             {
                 let atlas = &self.gui.atlas;
@@ -6272,11 +6257,11 @@ impl Game<'_> {
                     self.audio.capture = capture;
                 }
             }
-            if contextual == ContextualBar::Locator && !dota_hud {
+            if contextual == ContextualBar::Locator {
                 let draws = self.locator_bar_draws(wi, hi);
                 hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
-            if !spectator && !dota_hud {
+            if !spectator {
                 self.draw_selected_name(&mut batch, bar_height, !self.creative);
             }
         }
@@ -8992,6 +8977,10 @@ impl Game<'_> {
         .collect()
     }
     fn tick_mobs(&mut self) -> Result<()> {
+        if horizon_client::dota_map::loaded() {
+            self.mobs.clear();
+            return Ok(());
+        }
         self.tick_creatures()?;
         self.position_rider();
         self.tick_stats();
@@ -10620,8 +10609,6 @@ impl Game<'_> {
         // GameRenderer.renderItemInHand: F1 hides the hand with the HUD.
         if self.spectator()
             || self.ui.hide_gui
-            || self.dota.is_some()
-            || self.dota_pick.is_some()
             || self.sleeping.is_some()
             || !self.camera_type.first_person()
             || self
@@ -12267,9 +12254,6 @@ impl Game<'_> {
         if self.sort_key_press(key) {
             return Ok(());
         }
-        if self.dota_key(key) {
-            return Ok(());
-        }
         if self.remote.is_some() && self.remote_key(key)? {
             return Ok(());
         }
@@ -13203,9 +13187,6 @@ impl ApplicationHandler for Game<'_> {
                         // Neither edge of a bound button is an ordinary slot click.
                         return Ok(());
                     }
-                    if self.dota_mouse(button, pressed) {
-                        return Ok(());
-                    }
                     if pressed && self.sort_mouse_press(button) {
                         return Ok(());
                     }
@@ -13959,12 +13940,6 @@ impl<'a> Game<'a> {
             cursor_icon: horizon_client::widgets::Cursor::Arrow,
             captured: false,
             focused: true,
-            dota: None,
-            dota_shop: None,
-            dota_data: None,
-            dota_pick: None,
-            dota_ui: std::cell::RefCell::new(None),
-            dota_ui_failed: std::cell::Cell::new(false),
             modifiers: winit::keyboard::ModifiersState::empty(),
             fullscreen: horizon_client::window::FullscreenState::new(false),
             mouse: MouseLook::default(),
@@ -15318,7 +15293,6 @@ impl Loading {
         self.menu.set_root(root, &self.settings);
         self.gui = Some(gui);
         horizon_client::ui_theme::reset_atlas();
-        horizon_client::dota_text::reset_atlas();
         self.apply_menu_settings();
         let Some(window) = self.window.clone() else {
             return;

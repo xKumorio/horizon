@@ -3,8 +3,6 @@ exclude = ["launcher", "crates/horizon-telemetry-server", "crates/horizon-mod-re
 members = [
     "crates/horizon-core",
     "crates/horizon-dota",
-    "crates/icraft-ui",
-    "crates/panorama",
     "crates/horizon-dualsense",
     "crates/horizon-threads",
     "crates/horizon-hdr",

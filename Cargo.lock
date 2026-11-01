@@ -1402,12 +1402,10 @@ dependencies = [
  "horizon-theme",
  "horizon-threads",
  "horizon-world",
- "icraft-ui",
  "log",
  "miniz_oxide 0.8.9",
  "naga",
  "open",
- "panorama",
  "png",
  "pollster",
  "rustix 1.1.5",
@@ -1464,8 +1462,6 @@ dependencies = [
 name = "horizon-dota"
 version = "0.1.0"
 dependencies = [
- "icraft-ui",
- "panorama",
  "serde_json",
 ]
 
@@ -1720,14 +1716,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "icraft-ui"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2784,13 +2772,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
-]
-
-[[package]]
-name = "panorama"
-version = "0.1.0"
-dependencies = [
- "icraft-ui",
 ]
 
 [[package]]

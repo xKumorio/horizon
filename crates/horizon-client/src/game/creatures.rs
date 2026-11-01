@@ -299,6 +299,9 @@ impl Game<'_> {
         persistent: bool,
         scripted: bool,
     ) -> Option<u32> {
+        if horizon_client::dota_map::loaded() {
+            return None;
+        }
         let kind = if kind.contains(':') {
             kind.to_owned()
         } else {
@@ -4401,6 +4404,9 @@ impl Game<'_> {
     }
     /// Mob models and projectiles for the entity pass.
     pub(super) fn mob_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
+        if horizon_client::dota_map::loaded() {
+            return;
+        }
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let scale = self.view_scale();

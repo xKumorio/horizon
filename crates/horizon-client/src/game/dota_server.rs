@@ -40,7 +40,8 @@ pub(super) struct DotaServer {
 
 impl DotaServer {
     pub(super) fn load(options: &Options) -> Option<DotaServer> {
-        if !options.dota {
+        // The Dota map is a walk-through scene, without a match or unit spawns.
+        if !options.dota || horizon_client::dota_map::loaded() {
             return None;
         }
         let root = find_data_dir()?;

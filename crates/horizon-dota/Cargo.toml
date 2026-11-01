@@ -7,11 +7,7 @@ rust-version = "1.85"
 description = "Dota 2 match rules: Valve data tables and the server-side simulation"
 
 [dependencies]
-panorama = { path = "../panorama" }
 serde_json = "1"
-
-[dev-dependencies]
-icraft-ui = { path = "../icraft-ui" }
 
 [lints]
 workspace = true
