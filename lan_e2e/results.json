@@ -1,0 +1,12 @@
+{
+  "checks": {
+    "chat": {
+      "pass": true,
+      "skipped": false,
+      "detail": {
+        "guest": true,
+        "host": true
+      }
+    }
+  }
+}

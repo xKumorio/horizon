@@ -1,0 +1,22 @@
+Horizon 0.1.0
+wasm module cache disabled: folder C:\Users\root\AppData\Local\Temp\hzlan-guest-1s48p41v\.horizon-cache/wasm: Windows owner/DACL/inheritance trust is not verified; compiling wasm
+Horizon: ignoring minecraft:ambient_entity_effect: no such vanilla particle in this version
+Horizon: block sprites: 1301 layers at 64 px (largest 64 px, budget 256 MiB)
+load core tables: 1.09s
+load pack tables: 1.56s
+load items: 1.96s
+Horizon: resources loaded in 2.3s; 35723 block states, 1658 items, 67 biomes; 31 worker threads
+Horizon: no sound: audio off: HORIZON_NO_AUDIO is set
+Horizon: control socket C:\Users\root\AppData\Local\Temp\hzlan-guest-1s48p41v\c.sock
+Horizon renderer: asking Vulkan for a graphics device
+Horizon renderer: NVIDIA GeForce RTX 5060 Ti (Vulkan, DiscreteGpu)
+Horizon renderer: requesting the device (driver NVIDIA 621.14) with features [TEXTURE_FORMAT_16BIT_NORM | TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | PIPELINE_STATISTICS_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS | TIMESTAMP_QUERY_INSIDE_PASSES | MAPPABLE_PRIMARY_BUFFERS | MULTI_DRAW_INDIRECT_COUNT | VERTEX_WRITABLE_STORAGE | CLEAR_TEXTURE | TEXTURE_ATOMIC | SHADER_EARLY_DEPTH_TEST | SUBGROUP | TIMESTAMP_QUERY | INDIRECT_FIRST_INSTANCE | RG11B10UFLOAT_RENDERABLE | FLOAT32_FILTERABLE | FLOAT32_BLENDABLE] and the adapter's limits (buffers up to 1099511627776 bytes, storage bindings up to 2147483644 bytes, 2048 texture layers)
+Horizon renderer: device ready; configuring the surface (1280x720 Bgra8Unorm, Mailbox)
+Horizon renderer: HDR output not offered by this display
+Horizon renderer: creating the pipelines
+Horizon renderer: pipelines ready (multi-draw on, occlusion culling on, GPU culling available, GPU timer on)
+Horizon renderer: acquiring the first frame
+Horizon renderer: submitting the first frame
+Horizon renderer: presenting the first frame
+Horizon: first frame after 795 ms
+Horizon: worldgen data loaded in 249.7356ms
