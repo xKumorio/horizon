@@ -465,4 +465,41 @@ impl Game<'_> {
             }
         }
     }
+    /// Rebuild sections dirtied by individual block edits since `update_world` and upload them
+    /// before the current frame renders, matching vanilla's synchronous player-edit remesh
+    /// (`SectionRenderDispatcher.rebuildSectionSync`).
+    pub(in crate::game) fn flush_immediate_meshes(&mut self) {
+        if self.title.is_some()
+            || self.world.immediate_sections.is_empty()
+            || self.renderer.is_none()
+        {
+            self.world.immediate_sections.clear();
+            return;
+        }
+        self.observe_light_edits();
+        self.ask_edited_light_emission();
+        let uploads = self.streaming.mesh_immediate(&mut self.world);
+        if uploads.is_empty() {
+            return;
+        }
+        let fresh: horizon_client::fast_hash::FxHashSet<(i32, i32, i32)> =
+            uploads.iter().map(|(k, _)| *k).collect();
+        let spent: Vec<_> = self
+            .pending_uploads
+            .extract_if(.., |(k, _)| fresh.contains(k))
+            .collect();
+        if !spent.is_empty() {
+            self.streaming.free(spent);
+        }
+        if self.lod.is_some() {
+            self.lod_observe
+                .extend(uploads.iter().map(|(key, _)| (key.0, key.2)));
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            for (key, mesh) in &uploads {
+                renderer.upload(*key, mesh);
+            }
+        }
+        self.streaming.free(uploads);
+    }
 }
