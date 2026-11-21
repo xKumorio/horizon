@@ -3992,7 +3992,7 @@ mod tests {
                 {"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"location": {"block": {"blocks": "minecraft:water"}}}}
             ]}),
             json!({"flags": {"is_swimming": true, "is_flying": true}, "stepping_on": {"block": {"blocks": "minecraft:stone"}}}),
-            json!({"vehicle": {"type": "minecraft:horse"}, "effects": {"minecraft:speed": {}}}),
+            json!({"vehicle": {"entity_type": "minecraft:horse"}, "effects": {"minecraft:speed": {}}}),
             json!({"condition": "minecraft:inverted", "term": {"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}}}}),
             json!({"condition": "minecraft:any_of", "terms": [{"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}}}, {"flags": {"is_sprinting": true}}]}),
         ];

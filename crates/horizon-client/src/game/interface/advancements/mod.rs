@@ -156,6 +156,8 @@ pub(super) struct AdvState {
     pub(super) pending_tree: Option<std::thread::JoinHandle<Arc<Tree>>>,
     /// `inventory_changed`'s criteria by item, built for `tree`.
     inventory_index: Option<(Arc<Tree>, Arc<adv::InventoryIndex>)>,
+    /// Reusable candidate list for `tick_advancements` so matching ticks avoid allocating.
+    tick_candidates: Vec<(usize, usize)>,
 }
 impl AdvState {
     /// Drop the prefetched tree and the index built for the old one (a
@@ -1547,20 +1549,21 @@ impl Game<'_> {
             let tree = self.adv.tree.clone();
             if let Some(list) = tree.by_trigger.get("minecraft:tick") {
                 let filters = tree.tick_filters();
-                let mut candidates: Vec<(usize, usize)> = Vec::new();
+                let mut candidates = std::mem::take(&mut self.adv.tick_candidates);
+                candidates.clear();
                 for (pos, &(ai, ci)) in list.iter().enumerate() {
+                    let a = &tree.list[ai];
+                    if self.adv.progress.done(a) || self.adv.progress.has(&a.id, &a.criteria[ci].name)
+                    {
+                        continue;
+                    }
                     if filters
                         .get(pos)
                         .is_some_and(|f| !self.tick_filter_matches(f))
                     {
                         continue;
                     }
-                    let a = &tree.list[ai];
-                    if !self.adv.progress.has(&a.id, &a.criteria[ci].name)
-                        && !self.adv.progress.done(a)
-                    {
-                        candidates.push((ai, ci));
-                    }
+                    candidates.push((ai, ci));
                 }
                 if !candidates.is_empty() {
                     let me = self.player_entity_for("minecraft:tick");
@@ -1574,6 +1577,8 @@ impl Game<'_> {
                         adv::conditions(&c["player"], &ctx, w)
                     });
                 }
+                candidates.clear();
+                self.adv.tick_candidates = candidates;
             }
         }
         // ServerPlayer.onEffectAdded and onEffectsRemoved keep the start of a
