@@ -165,11 +165,38 @@ fn prepare_world(shared: &Arc<Shared>, dir: &Path, config: &Config) -> Result<()
     Ok(())
 }
 
+/// `[proxy]` on: starts its listener on the public port and says which port the game listens on, behind it.
+/// With it off, a `forwarding.secret` the proxy left is removed (the game would refuse everyone else with it).
+fn start_proxy(shared: &Arc<Shared>, dir: &Path, config: &Config) -> Result<Option<u16>, String> {
+    if !config.proxy.enabled {
+        crate::proxy::remove_own_secret(dir);
+        return Ok(None);
+    }
+    let mut config = config.clone();
+    if config.proxy.game_port == 0 {
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("[proxy] has no free port: {e}"))?;
+        config.proxy.game_port = free.local_addr().map_err(|e| e.to_string())?.port();
+    }
+    let log = shared.clone();
+    let proxy = crate::proxy::start(dir, &config, move |level, line| note(&log, level, line))?;
+    *shared.proxy.lock().unwrap() = Some(proxy);
+    note(
+        shared,
+        "INFO",
+        &format!(
+            "Proxy on port {}: the game listens on 127.0.0.1:{} behind it",
+            config.server.port, config.proxy.game_port
+        ),
+    );
+    Ok(Some(config.proxy.game_port))
+}
+
 enum Exit {
     /// Asked to stop, or the game ended by itself without an error (`stop` typed in its console, the EULA
     /// not agreed, the port taken): not restarted.
     Stopped,
-    /// Asked to restart (`horizon-server restart`).
+    /// Asked to restart (`horizon-server restart`, `/restart`).
     Restart,
     Crashed(ExitStatus),
     /// Started on another release, the game wasn't up in time and was stopped.
@@ -234,6 +261,8 @@ pub fn run(dir: &Path) -> Result<(), String> {
     crate::discord::start(shared.clone(), config.discord.clone());
     schedule_backups(shared.clone());
     check_updates(shared.clone());
+    // `[proxy]` is decided here, once: its listener lives as long as the supervisor.
+    let game_port = start_proxy(&shared, dir, &config)?;
     let console = console_lines();
     let mut crashes: Vec<Instant> = Vec::new();
     let mut watch: Option<Watch> = None;
@@ -241,7 +270,11 @@ pub fn run(dir: &Path) -> Result<(), String> {
     loop {
         // Read again before every start: edits to server.toml apply on the next restart, and so does a
         // switch to another release.
-        let config = Config::load(dir)?;
+        let mut config = Config::load(dir)?;
+        config.proxy.enabled = game_port.is_some();
+        if let Some(port) = game_port {
+            config.proxy.game_port = port;
+        }
         // Queued while the game ran, stopped or was already stopping: applied before this start,
         // whatever ended the last game, not left for some later restart.
         if let Some(w) = apply_queued(&shared, dir, &config) {
@@ -303,6 +336,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
             w.deadline = Instant::now() + w.timeout;
         }
         let exit = supervise(&shared, &mut child, &console, &mut watch);
+        shared.proxy_game_up(false);
         {
             let mut state = shared.state.lock().unwrap();
             state.engine_pid = None;
@@ -784,6 +818,7 @@ fn supervise(
     let mut not_up = false;
     let mut handled = signals::requests();
     loop {
+        shared.proxy_game_up(up(shared));
         if let Some(w) = watch.as_ref() {
             if up(shared) {
                 came_up(shared, w);
@@ -865,6 +900,16 @@ fn supervise(
         match child.try_wait() {
             Ok(Some(_)) if not_up => return Exit::NotUp,
             Ok(Some(_)) if restart => return Exit::Restart,
+            // `/restart` in game, on the console or through RCON: the game saved, stopped and says so by its exit
+            // code. A shutdown asked for since wins: it is not started again.
+            Ok(Some(status))
+                if status.code() == Some(engine::RESTART_EXIT_CODE)
+                    && !shared.shutdown.load(Ordering::SeqCst) =>
+            {
+                note(shared, "INFO", "Restarting the server");
+                shared.set_phase(Phase::Restarting);
+                return Exit::Restart;
+            }
             Ok(Some(status)) if stopping.is_some() || status.success() => return Exit::Stopped,
             Ok(Some(status)) => return Exit::Crashed(status),
             Ok(None) => thread::sleep(Duration::from_millis(50)),
@@ -927,7 +972,7 @@ mod tests {
         let world = dir.join("world");
         std::fs::create_dir_all(&world).unwrap();
         std::fs::write(world.join("level.dat"), b"before").unwrap();
-        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        std::fs::write(dir.join("server.toml"), config::TEMPLATE).unwrap();
         let name = backup::file_name(std::time::SystemTime::now(), None).unwrap();
         backup::create(&dir, &config, &name).unwrap();
         std::fs::write(world.join("level.dat"), b"after").unwrap();
@@ -973,7 +1018,7 @@ mod tests {
         broken[8192..8196].copy_from_slice(&u32::MAX.to_be_bytes());
         std::fs::write(&entity, &broken).unwrap();
         let terrain = std::fs::read(ow.join("region/r.2.0.mca")).unwrap();
-        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        std::fs::write(dir.join("server.toml"), config::TEMPLATE).unwrap();
         let mut config = Config::load(&dir).unwrap();
         config.prune_chunks.mode = horizon_server_launch::prune::Mode::Delete;
         config.prune_chunks.spawn_radius = 4;
@@ -991,7 +1036,7 @@ mod tests {
             std::env::temp_dir().join(format!("horizon-server-prune-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        std::fs::write(dir.join("server.toml"), config::TEMPLATE).unwrap();
         let config = Config::load(&dir).unwrap();
         assert_eq!(
             config.prune_chunks.mode,
@@ -1247,6 +1292,26 @@ mod tests {
         assert!(ended.recv_timeout(Duration::from_millis(300)).is_err());
         stop(&shared);
         assert_eq!(ended.recv_timeout(Duration::from_secs(5)), Ok(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "daily"]
+    fn the_restart_exit_code_starts_the_game_again_and_others_do_not() {
+        let dir = std::env::temp_dir().join(format!("horizon-server-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_console, console) = mpsc::channel();
+        let run = |script: &str| {
+            let shared = Shared::with_install(&dir, None);
+            let mut child = game(script);
+            (supervise(&shared, &mut child, &console, &mut None), shared)
+        };
+        let (exit, shared) = run(&format!("exit {}", engine::RESTART_EXIT_CODE));
+        assert!(matches!(exit, Exit::Restart));
+        assert_eq!(shared.state.lock().unwrap().phase, Phase::Restarting);
+        assert!(matches!(run("exit 0").0, Exit::Stopped));
+        assert!(matches!(run("exit 1").0, Exit::Crashed(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
