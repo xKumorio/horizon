@@ -907,25 +907,30 @@ pub(super) mod audience_tests {
         use horizon_core::LevelKey;
         use horizon_world::dimension_type::DimensionFacts;
 
-        struct ResetLevelFacts;
-        impl Drop for ResetLevelFacts {
-            fn drop(&mut self) {
-                DimensionFacts::set_levels(Vec::new());
-            }
-        }
+        crate::game::in_own_process(
+            "game::bossbars::audience_tests::non_end_dimension_with_dragon_fight_does_not_skip_boss_bars",
+            || {
+                struct ResetLevelFacts;
+                impl Drop for ResetLevelFacts {
+                    fn drop(&mut self) {
+                        DimensionFacts::set_levels(Vec::new());
+                    }
+                }
 
-        super::super::native_entity_refs::tests::with_game(|game| {
-            assert_eq!(game.dim, super::Dim::Overworld);
-            assert!(!game.dimension_type().has_ender_dragon_fight);
-            assert!(!game.has_boss_bar_sources());
+                super::super::native_entity_refs::tests::with_game(|game| {
+                    assert_eq!(game.dim, super::Dim::Overworld);
+                    assert!(!game.dimension_type().has_ender_dragon_fight);
+                    assert!(!game.has_boss_bar_sources());
 
-            let _guard = ResetLevelFacts;
-            let mut own = DimensionFacts::overworld().clone();
-            own.has_ender_dragon_fight = true;
-            DimensionFacts::set_levels(vec![(LevelKey::OVERWORLD, own)]);
-            assert!(game.dimension_type().has_ender_dragon_fight);
-            assert!(game.has_boss_bar_sources());
-        });
+                    let _guard = ResetLevelFacts;
+                    let mut own = DimensionFacts::overworld().clone();
+                    own.has_ender_dragon_fight = true;
+                    DimensionFacts::set_levels(vec![(LevelKey::OVERWORLD, own)]);
+                    assert!(game.dimension_type().has_ender_dragon_fight);
+                    assert!(game.has_boss_bar_sources());
+                });
+            },
+        );
     }
 
     #[test]
