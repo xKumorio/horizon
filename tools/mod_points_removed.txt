@@ -7,3 +7,4 @@
 # `#[horizon_mod_api_macros::replaceable]` on it in the lower crate (an issue is enough); that keeps its point.
 #
 # One line per point: name | #PR | short reason. Lines starting with # are comments.
+sculk_stand_on | #19325 | take slice instead of owned Vec to avoid per-tick player allocation

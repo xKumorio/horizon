@@ -1312,7 +1312,7 @@ impl Game<'_> {
                 standing.push((Who::Mob(m.id), [m.position.x, m.position.y, m.position.z]));
             }
         }
-        self.sculk_stand_on(standing);
+        self.sculk_stand_on(&standing);
     }
     /// `stepOn` for the player in place: the host, or a guest swapped in
     /// (`guest_server_tick`), as a server has no player of its own.
@@ -1324,13 +1324,10 @@ impl Game<'_> {
             && p.ground.on_ground
         {
             let at = [p.position.x, p.position.y, p.position.z];
-            self.sculk_stand_on_slice(&[(Who::Player, at)]);
+            self.sculk_stand_on(&[(Who::Player, at)]);
         }
     }
-    fn sculk_stand_on(&mut self, standing: Vec<(Who, [f64; 3])>) {
-        self.sculk_stand_on_slice(&standing);
-    }
-    fn sculk_stand_on_slice(&mut self, standing: &[(Who, [f64; 3])]) {
+    fn sculk_stand_on(&mut self, standing: &[(Who, [f64; 3])]) {
         for &(who, at) in standing {
             // getOnPosLegacy: 0.2 below the feet.
             let key = (
