@@ -7,3 +7,9 @@
 # `#[horizon_mod_api_macros::replaceable]` on it in the lower crate (an issue is enough); that keeps its point.
 #
 # One line per point: name | #PR | short reason. Lines starting with # are comments.
+remote_player_names | #19070 | borrows player names as &str instead of allocating String per player
+remote_player_names_body | #19070 | borrows player names as &str instead of allocating String per player
+other_players | #19070 | borrows player names as &str instead of cloning String per player
+styled_name_tag_quads | #19070 | reuses caller-provided HudBatch across tags instead of allocating per tag
+game_names_first_mob_indices | #19070 | uses FxHashMap instead of std HashMap for per-frame mob id index
+game_names_named_by_player_list | #19070 | takes borrowed &str slice and returns FxHashSet

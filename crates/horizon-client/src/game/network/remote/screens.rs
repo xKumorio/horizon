@@ -262,14 +262,14 @@ impl Game<'_> {
     /// Status for `horizon-ctl status`.
     /// The other players' entities in the level and their names (their
     /// profiles', which outlive the player list's entries).
-    pub(super) fn remote_player_names_body(&self) -> Vec<(u32, String)> {
+    pub(super) fn remote_player_names_body(&self) -> Vec<(u32, &str)> {
         let Some(r) = self.remote.as_ref() else {
             return Vec::new();
         };
         r.level_players
             .iter()
             .filter(|(_, uuid)| **uuid != r.profile)
-            .filter_map(|(id, uuid)| Some((*id as u32, r.level_player_name(*id, uuid)?.to_owned())))
+            .filter_map(|(id, uuid)| Some((*id as u32, r.level_player_name(*id, uuid)?)))
             .collect()
     }
     /// `ClientClockManager.tick`: the clock moves on by the game time that

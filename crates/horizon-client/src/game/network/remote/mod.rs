@@ -1596,7 +1596,7 @@ impl Game<'_> {
     pub(super) fn remote_player_uuid(&self, id: u32) -> Option<u128> {
         self.remote_player_uuid_body(id)
     }
-    pub(super) fn remote_player_names(&self) -> Vec<(u32, String)> {
+    pub(super) fn remote_player_names(&self) -> Vec<(u32, &str)> {
         self.remote_player_names_body()
     }
     fn remote_clock_tick(&mut self) {

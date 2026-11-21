@@ -8130,13 +8130,8 @@ impl Game<'_> {
                 if !invisible {
                     self.player_cape_geometry(mob, chest, camera, alpha as f32, packed, out);
                 }
-                if !invisible
-                    && let Some((_, name)) = self
-                        .remote_player_names()
-                        .into_iter()
-                        .find(|(id, _)| *id == mob.id)
-                {
-                    self.player_ears_geometry(mob, &name, camera, alpha as f32, packed, out);
+                if !invisible && let Some(name) = who.as_ref().map(|w| w.name) {
+                    self.player_ears_geometry(mob, name, camera, alpha as f32, packed, out);
                 }
                 self.player_elytra_geometry(mob, chest, camera, alpha as f32, packed, out);
                 self.shoulder_parrots_geometry(mob, camera, alpha as f32, packed, out);
