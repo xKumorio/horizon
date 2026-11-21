@@ -819,13 +819,14 @@ impl Game<'_> {
             name: &name,
             local: true,
         };
-        let listened = self.mob_render_listened();
-        let pre = self.mod_render_pre(m, Some(who), listened, alpha as f32, camera, packed, out);
+        let hooks = self.mob_render_listened();
+        let pre = self.mod_render_pre(m, Some(who), hooks, alpha as f32, camera, packed, out);
         let Some(hidden) = pre else {
             return;
         };
         // The mods' layers' posed parts, kept from the draw below while they want them.
         let (mut parts, layers) = (None, self.mod_layers(m));
+        let want_parts = hooks.any_post_for(true) || layers.is_some();
         // A spectator still draws its own model in third person: the poses'
         // visibility (set by player_model_visibility) hides body parts, and
         // translucent_body marks the body OIT for the ghostly look. Only first
@@ -840,7 +841,7 @@ impl Game<'_> {
                 self.res.mob_data(),
                 &self.player_armor_layers(),
                 hidden,
-                (listened || layers.is_some()).then_some(&mut parts),
+                want_parts.then_some(&mut parts),
                 out,
             );
         } else {
@@ -852,7 +853,7 @@ impl Game<'_> {
                 packed,
                 self.res.mob_data(),
                 &self.player_armor_layers(),
-                (listened || layers.is_some()).then_some(&mut parts),
+                want_parts.then_some(&mut parts),
                 out,
             );
         }
@@ -893,7 +894,9 @@ impl Game<'_> {
             );
         }
         // The post hooks, whether or not the layers drew (a spectator draws none).
-        self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
+        if hooks.any_post() {
+            self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
+        }
         // LivingEntity.isCurrentlyGlowing: the Glowing effect.
         let vanilla = self
             .potions
