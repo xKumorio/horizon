@@ -1306,9 +1306,85 @@ pub fn finish_tick(
     if m.no_ai && m.species() == Species::Dolphin {
         m.air = m.max_air_supply();
     }
+    if m.species() == Species::Mannequin {
+        m.extra.static_env_stamp = if m.is_static_mannequin() {
+            let at = m.position;
+            let below = w.world.block(
+                at.x.floor() as i32,
+                (at.y - 0.2).floor() as i32,
+                at.z.floor() as i32,
+            );
+            let inside = w.world.block(
+                at.x.floor() as i32,
+                at.y.floor() as i32,
+                at.z.floor() as i32,
+            );
+            let inert = !matches!(
+                &*w.facts.get(below).name,
+                "minecraft:turtle_egg"
+                    | "minecraft:magma_block"
+                    | "minecraft:cactus"
+                    | "minecraft:sweet_berry_bush"
+                    | "minecraft:campfire"
+                    | "minecraft:soul_campfire"
+                    | "minecraft:pointed_dripstone"
+                    | "minecraft:wither_rose"
+            ) && !matches!(
+                &*w.facts.get(inside).name,
+                "minecraft:cactus"
+                    | "minecraft:sweet_berry_bush"
+                    | "minecraft:wither_rose"
+                    | "minecraft:fire"
+                    | "minecraft:soul_fire"
+                    | "minecraft:powder_snow"
+            );
+            inert.then_some((
+                w.world.revision,
+                [at.x.to_bits(), at.y.to_bits(), at.z.to_bits()],
+            ))
+        } else {
+            None
+        };
+    }
     // TraderLlama.maybeDespawn discards the llama in its aiStep: it leaves the
     // level's entity list in this tick, after the rest of its tick ran.
     !(m.removed && m.species() == Species::TraderLlama)
+}
+
+/// Lightweight tick for an immovable, invulnerable mannequin verified stationary in an inert
+/// environment at `(world_revision, m.position)`. Falls back to a full tick automatically on any
+/// world edit (`world_revision` change), any teleport (position bit change even when `previous`
+/// matches `position`), or any flag, velocity, or effect change.
+pub fn tick_static_mannequin(m: &mut Mob, world_revision: u64, bottom_y: i32) -> bool {
+    let stamp = (
+        world_revision,
+        [
+            m.position.x.to_bits(),
+            m.position.y.to_bits(),
+            m.position.z.to_bits(),
+        ],
+    );
+    if m.extra.static_env_stamp != Some(stamp)
+        || !m.is_static_mannequin()
+        || m.position.y < f64::from(bottom_y - 64)
+    {
+        return false;
+    }
+    m.prepare_tick();
+    m.age += 1;
+    m.previous = m.position;
+    m.previous_yaw = m.yaw;
+    m.previous_body_yaw = m.body_yaw;
+    m.previous_head_yaw = m.head_yaw;
+    m.previous_head_pitch = m.head_pitch;
+    m.previous_swell = m.swell;
+    m.anim.begin_tick();
+    super::finalize::refresh_dirty_attributes(m);
+    m.body_rotation_tick();
+    m.update_walk_animation();
+    m.anim.end_tick(false);
+    tick_swing(m);
+    true
 }
 /// `LivingEntity.aiStep` -> `Entity.applyEffectsFromBlocks` for the blocks
 /// that hurt, hold or slide a mob: the cactus (`CactusBlock.entityInside`, 1),
@@ -1335,16 +1411,18 @@ pub(crate) fn effects_from_blocks(
         // 0.2 below the feet, or the supporting block when the centre is over
         // its edge.
         let [x, y, z] = m.block_on_legacy(w);
+        let state = w.world.block(x, y, z);
+        let name: &str = &w.facts.get(state).name;
         crate::block_contact::step_on(
-            w.block_name(x, y, z),
+            name,
             crate::block_contact::Contact {
                 entity: m.id as i32,
                 kind: &m.kind.id,
-                state: w.world.block(x, y, z),
+                state,
                 position: horizon_core::position::BlockPos::new(x, y, z),
             },
         );
-        if w.block_name(x, y, z) == "minecraft:magma_block" {
+        if name == "minecraft:magma_block" {
             m.damage(level, 1.0, Damage::of(DamageKind::HotFloor));
             // Enderman.hurtServer finishes before stepOn returns; the scan
             // below still uses the movements captured before that hurt.
@@ -1354,7 +1432,7 @@ pub(crate) fn effects_from_blocks(
         // it breaks one time in a hundred (`destroyEgg`), unless it is a turtle
         // or a bat or mob griefing is off (`canDestroyEgg`); the roll is the
         // level's and comes only after those checks.
-        if w.block_name(x, y, z) == "minecraft:turtle_egg"
+        if name == "minecraft:turtle_egg"
             && !matches!(m.species(), Species::Turtle | Species::Bat)
             && w.can_grief(m.id)
             && level.random().next_int_bound(100).unwrap_or(1) == 0
@@ -1933,6 +2011,7 @@ fn base_tick(
             subject: None,
         };
         if m.species() != Species::Vex
+            && !m.invulnerable_flag
             && in_wall(
                 m.width(),
                 [m.position.x, m.eye_y(), m.position.z],
@@ -3729,7 +3808,9 @@ pub fn custom_travel(
 /// `Entity.checkInsideBlocks` sweeps it, so a mob falling past a flower is
 /// inside it on the way.
 fn flower_contact_effects(m: &mut Mob, w: &MobWorld) {
-    if !m.alive() {
+    if !m.alive()
+        || ((w.difficulty.base == 0 || m.invulnerable_flag) && m.species() != Species::Bee)
+    {
         return;
     }
     let inset = f64::from(1.0e-5_f32);
@@ -7939,5 +8020,51 @@ mod walk_target_tests {
         );
         // Without the extracted vanilla data the world cannot be built.
         assert!(ran, "vanilla data is missing");
+    }
+
+    #[test]
+    fn static_mannequin_fast_path_ticks_and_invalidates_on_world_edit_or_teleport() {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:mannequin".into();
+        kind.species = Species::Mannequin;
+        kind.category = "misc".into();
+        let mut m = Mob::new(1, Arc::new(kind), Vec3::new(0.5, 71.0, 0.5), 90.0);
+        m.first_tick = false;
+        m.invulnerable_flag = true;
+        m.extra.immovable = true;
+        m.effects_dirty = false;
+        m.extra.effects.push(crate::mobs::StoredEffect::new(
+            "minecraft:resistance",
+            -1,
+            4,
+        ));
+        assert!(m.is_static_mannequin());
+        assert!(!tick_static_mannequin(&mut m, 42, -64));
+
+        m.extra.static_env_stamp = Some((
+            42,
+            [0.5_f64.to_bits(), 71.0_f64.to_bits(), 0.5_f64.to_bits()],
+        ));
+        let age_before = m.age;
+        assert!(tick_static_mannequin(&mut m, 42, -64));
+        assert_eq!(m.age, age_before + 1);
+
+        // Any block edit bumps world.revision -> automatically falls back to full tick.
+        assert!(!tick_static_mannequin(&mut m, 43, -64));
+
+        // Any teleport updates position (even with previous == position and unchanged world.revision)
+        // -> position-bit stamp mismatch invalidates fast path and falls back to full tick.
+        m.position = Vec3::new(10.5, 71.0, 10.5);
+        m.previous = m.position;
+        assert!(!tick_static_mannequin(&mut m, 42, -64));
+        m.position = Vec3::new(0.5, 71.0, 0.5);
+        m.previous = m.position;
+
+        // Finite effect also falls back so duration counts down.
+        m.extra
+            .effects
+            .push(crate::mobs::StoredEffect::new("minecraft:speed", 20, 0));
+        assert!(!m.is_static_mannequin());
+        assert!(!tick_static_mannequin(&mut m, 42, -64));
     }
 }
