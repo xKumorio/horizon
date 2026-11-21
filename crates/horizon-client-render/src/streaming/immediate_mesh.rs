@@ -51,9 +51,11 @@ fn take_ready_immediate_sections(
         }
         let mut accepted = SectionMask::EMPTY;
         for sy in sections.iter().map(|sy| sy as i32) {
-            if dirty.remove((x, sy, z)) {
-                accepted.insert(sy as usize);
-            }
+            // Remove from `dirty` if still queued; even if streaming already removed it to
+            // dispatch a worker job, accept it so the synchronous rebuild supersedes the
+            // in-flight worker job.
+            dirty.remove((x, sy, z));
+            accepted.insert(sy as usize);
         }
         if !accepted.is_empty() {
             ready_columns.push(((x, z), accepted));
@@ -70,7 +72,17 @@ impl Streaming {
             world.immediate_sections.clear();
             return Vec::new();
         }
-        if !world.light_edits.is_empty() && world.light_edits.len() <= INLINE_RELIGHT_MAX {
+        if !world.light_edits.is_empty() {
+            if world.light_edits.len() > INLINE_RELIGHT_MAX {
+                // Pending lighting exceeds the inline budget: leave all affected sections dirty
+                // for the normal relighting and worker meshing path instead of uploading stale light.
+                for ((x, z), sections) in std::mem::take(&mut world.immediate_sections).columns() {
+                    for sy in sections.iter().map(|sy| sy as i32) {
+                        world.dirty_sections.insert((x, sy, z));
+                    }
+                }
+                return Vec::new();
+            }
             self.relight_edits(world);
         }
         let ready_columns = {
@@ -150,14 +162,14 @@ mod tests {
     fn set_block_marks_immediate_sections_for_edit_and_neighbours() {
         let mut world = World::new(BlockStateId(0), 0);
         world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
-        world.set_block(8, 64, 8, BlockStateId(1), true).unwrap();
+        world.set(8, 64, 8, BlockStateId(1)).unwrap();
         let sy = (64 - world.bottom_y()) >> 4;
         assert!(world.immediate_sections.contains(&(0, sy, 0)));
         assert!(world.dirty_sections.contains(&(0, sy, 0)));
         // Corner of a section marks up to 8 sections (within IMMEDIATE_MESH_LIMIT).
         world.immediate_sections.clear();
         world.dirty_sections.clear();
-        world.set_block(0, 64, 0, BlockStateId(2), true).unwrap();
+        world.set(0, 64, 0, BlockStateId(2)).unwrap();
         assert_eq!(world.immediate_sections.len(), 8);
         assert!(world.immediate_sections.len() <= IMMEDIATE_MESH_LIMIT);
     }
@@ -248,5 +260,33 @@ mod tests {
         assert!(ready.is_empty());
         assert!(immediate.is_empty());
         assert!(dirty.contains(&(0, 4, 0)));
+    }
+
+    #[test]
+    fn take_ready_immediate_accepts_sections_already_dispatched_to_workers() {
+        let mut immediate = DirtySections::default();
+        let mut dirty = DirtySections::default();
+        let mut lit = FxHashSet::default();
+        let lighting = FxHashMap::default();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                lit.insert((dx, dz));
+            }
+        }
+        // Simulate an edit whose dirty entry was already consumed by streaming worker dispatch.
+        immediate.insert((0, 4, 0));
+
+        let ready = take_ready_immediate_sections(
+            &mut immediate,
+            &mut dirty,
+            &lit,
+            &lighting,
+            |_, _| true,
+            |_, _| true,
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, (0, 0));
+        assert!(ready[0].1.contains(4));
+        assert!(immediate.is_empty());
     }
 }
