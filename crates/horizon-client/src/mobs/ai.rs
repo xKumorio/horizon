@@ -1328,9 +1328,13 @@ pub fn finish_tick(
                     }
                 }
             }
+            if inert && mob_in_wall(m, w) {
+                inert = false;
+            }
             inert.then_some((
                 w.world.revision,
                 [at.x.to_bits(), at.y.to_bits(), at.z.to_bits()],
+                [m.width().to_bits(), m.height().to_bits()],
             ))
         } else {
             None
@@ -1339,6 +1343,42 @@ pub fn finish_tick(
     // TraderLlama.maybeDespawn discards the llama in its aiStep: it leaves the
     // level's entity list in this tick, after the rest of its tick ran.
     !(m.removed && m.species() == Species::TraderLlama)
+}
+
+/// `Entity.isInWall`: whether a suffocating block collision shape intersects the mob's eye box.
+fn mob_in_wall(m: &Mob, w: &MobWorld) -> bool {
+    let mut scene = crate::collisions::SceneCollisions {
+        world: w.world,
+        binding: w.collision,
+        subject: None,
+    };
+    in_wall(
+        m.width(),
+        [m.position.x, m.eye_y(), m.position.z],
+        |x, y, z, eye_bounds| {
+            let p = [x, y, z];
+            let state = w.world.block(x, y, z);
+            if !w
+                .suffocation
+                .is_suffocating(&mut scene, state, p)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            w.collision
+                .collision_shape(&mut scene, state, p)
+                .ok()
+                .is_some_and(|shape| {
+                    let Ok(eye_shape) = VoxelShape::from_box(*eye_bounds) else {
+                        return false;
+                    };
+                    shape
+                        .moved(Vec3::new(f64::from(x), f64::from(y), f64::from(z)))
+                        .join_is_not_empty(&eye_shape, ShapeOp::AND)
+                        .unwrap_or(false)
+                })
+        },
+    )
 }
 
 /// Returns `true` when the supporting block under a static mannequin is a vanilla block with no
@@ -1376,9 +1416,10 @@ fn is_inert_static_mannequin_inside(name: &str) -> bool {
 }
 
 /// Lightweight tick for an immovable, invulnerable mannequin verified stationary in an inert
-/// environment at `(world_revision, m.position)`. Falls back to a full tick automatically on any
-/// world edit (`world_revision` change), any teleport (position bit change even when `previous`
-/// matches `position`), or any flag, velocity, or effect change.
+/// environment at `(world_revision, m.position, [width, height])`. Falls back to a full tick
+/// automatically on any world edit (`world_revision` change), any teleport (position bit change
+/// even when `previous` matches `position`), any pose/scale box change, or any flag, velocity,
+/// or effect change.
 pub fn tick_static_mannequin(m: &mut Mob, world_revision: u64, bottom_y: i32) -> bool {
     let stamp = (
         world_revision,
@@ -1387,6 +1428,7 @@ pub fn tick_static_mannequin(m: &mut Mob, world_revision: u64, bottom_y: i32) ->
             m.position.y.to_bits(),
             m.position.z.to_bits(),
         ],
+        [m.width().to_bits(), m.height().to_bits()],
     );
     if m.extra.static_env_stamp != Some(stamp)
         || !m.is_static_mannequin()
@@ -2029,41 +2071,7 @@ fn base_tick(
     if m.alive() {
         // LivingEntity.baseTick: a suffocating shape intersects the eye. Entity.isInWall
         // is false under noPhysics, which Vex.tick holds while it ticks.
-        let mut scene = crate::collisions::SceneCollisions {
-            world: w.world,
-            binding: w.collision,
-            subject: None,
-        };
-        if m.species() != Species::Vex
-            && !m.invulnerable_flag
-            && in_wall(
-                m.width(),
-                [m.position.x, m.eye_y(), m.position.z],
-                |x, y, z, eye_bounds| {
-                    let p = [x, y, z];
-                    let state = w.world.block(x, y, z);
-                    if !w
-                        .suffocation
-                        .is_suffocating(&mut scene, state, p)
-                        .unwrap_or(false)
-                    {
-                        return false;
-                    }
-                    w.collision
-                        .collision_shape(&mut scene, state, p)
-                        .ok()
-                        .is_some_and(|shape| {
-                            let Ok(eye_shape) = VoxelShape::from_box(*eye_bounds) else {
-                                return false;
-                            };
-                            shape
-                                .moved(Vec3::new(f64::from(x), f64::from(y), f64::from(z)))
-                                .join_is_not_empty(&eye_shape, ShapeOp::AND)
-                                .unwrap_or(false)
-                        })
-                },
-            )
-        {
+        if m.species() != Species::Vex && mob_in_wall(m, w) {
             m.damage(level, 1.0, Damage::of(DamageKind::InWall));
         }
         // Air supply and drowning (WaterAnimal.handleAirSupply for aquatic mobs).
@@ -8068,10 +8076,17 @@ mod walk_target_tests {
         m.extra.static_env_stamp = Some((
             42,
             [0.5_f64.to_bits(), 71.0_f64.to_bits(), 0.5_f64.to_bits()],
+            [m.width().to_bits(), m.height().to_bits()],
         ));
         let age_before = m.age;
         assert!(tick_static_mannequin(&mut m, 42, -64));
         assert_eq!(m.age, age_before + 1);
+
+        // Pose / box-size change invalidates the stamp -> falls back to full tick.
+        m.extra.avatar_pose = crate::pose::Pose::Crouching;
+        assert!(!tick_static_mannequin(&mut m, 42, -64));
+        m.extra.avatar_pose = crate::pose::Pose::Standing;
+        assert!(tick_static_mannequin(&mut m, 42, -64));
 
         // Any block edit bumps world.revision -> automatically falls back to full tick.
         assert!(!tick_static_mannequin(&mut m, 43, -64));

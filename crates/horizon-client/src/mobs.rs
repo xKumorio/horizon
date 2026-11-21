@@ -996,7 +996,7 @@ pub struct Extra {
     /// Runtime-only: `(world.revision, [x.to_bits(), y.to_bits(), z.to_bits()])` at which an
     /// immovable, invulnerable mannequin was last verified stationary in an inert environment
     /// (dry, unlit, not in powder snow).
-    pub static_env_stamp: Option<(u64, [u64; 3])>,
+    pub static_env_stamp: Option<(u64, [u64; 3], [u32; 2])>,
     /// `LivingEntity`'s `minecraft:scale` (`getScale`), which scales its box
     /// (`getDimensions`), eye height and model (`LivingEntityRenderState.scale`):
     /// the local player's own, and on a server every living entity's from its

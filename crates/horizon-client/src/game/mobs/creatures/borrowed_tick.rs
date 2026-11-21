@@ -243,6 +243,7 @@ impl Game<'_> {
                                     m.position.y.to_bits(),
                                     m.position.z.to_bits(),
                                 ],
+                                [m.width().to_bits(), m.height().to_bits()],
                             ))
                         && !mod_api::__private::listened(mod_api::HookId::LivingChangeTarget)
                     {
