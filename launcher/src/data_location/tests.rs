@@ -279,6 +279,347 @@ fn source_entry_link_is_rejected_without_touching_its_target() {
     assert_eq!(fs::read(outside.0.join("sentinel")).unwrap(), b"untouched");
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn game_cache_links_are_left_out_of_the_move() {
+    let f = Fixture::new("build");
+    let assets = f.source.launcher.join("versions/x/assets");
+    fs::create_dir_all(&assets).unwrap();
+    fs::write(assets.join("sentinel"), b"untouched").unwrap();
+    struct Link(PathBuf);
+    impl Drop for Link {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            let _ = fs::remove_file(&self.0);
+            #[cfg(windows)]
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    let mut links = Vec::new();
+    for instance in [
+        f.source.game.clone(),
+        f.source.game.join("instances/a"),
+        f.source.game.join("ports/p/home"),
+    ] {
+        let stamp = instance.join(".horizon-cache/mod-content/0123456789abcdef");
+        fs::create_dir_all(&stamp).unwrap();
+        fs::write(stamp.join("STAMP"), b"stamp").unwrap();
+        let link = stamp.join("assets");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&assets, &link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link.to_string_lossy().replace('/', "\\"))
+                .arg(assets.to_string_lossy().replace('/', "\\"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction setup: {output:?}");
+        }
+        links.push(Link(link));
+    }
+    fs::write(f.source.game.join("instances/a/options.txt"), b"options").unwrap();
+    // A world may carry the cache's name; only the game's own caches are left out.
+    let world = f.source.game.join("saves/.horizon-cache");
+    fs::create_dir_all(&world).unwrap();
+    fs::write(world.join("level.dat"), b"world").unwrap();
+    let roots = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    drop(links);
+    assert!(!roots.game.join(".horizon-cache").exists());
+    assert!(!roots.game.join("instances/a/.horizon-cache").exists());
+    assert!(!roots.game.join("ports/p/home/.horizon-cache").exists());
+    assert_eq!(
+        fs::read(roots.game.join("saves/.horizon-cache/level.dat")).unwrap(),
+        b"world"
+    );
+    assert_eq!(
+        fs::read(roots.game.join("instances/a/options.txt")).unwrap(),
+        b"options"
+    );
+    assert_eq!(
+        fs::read(roots.game.join("saves/dummy/level.dat")).unwrap(),
+        b"\0\xff\x80world\0"
+    );
+    assert_eq!(fs::read(assets.join("sentinel")).unwrap(), b"untouched");
+    assert_eq!(
+        fs::read(roots.launcher.join("versions/x/assets/sentinel")).unwrap(),
+        b"untouched"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn other_launchers_links_are_left_out_of_the_move() {
+    let f = Fixture::new("build");
+    let outside = Temp::new();
+    for dir in ["libraries", "assets"] {
+        fs::create_dir(outside.0.join(dir)).unwrap();
+        fs::write(outside.0.join(dir).join("sentinel"), b"untouched").unwrap();
+    }
+    fs::write(outside.0.join("client.jar"), b"jar").unwrap();
+    struct Link(PathBuf);
+    impl Drop for Link {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            #[cfg(windows)]
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    let linked = f.source.launcher.join("linked-minecraft");
+    let version = linked.join("versions/1.0");
+    fs::create_dir_all(&version).unwrap();
+    fs::write(version.join("1.0.json"), b"{}").unwrap();
+    let mut links = Vec::new();
+    for dir in ["libraries", "assets"] {
+        let link = linked.join(dir);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.0.join(dir), &link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link.to_string_lossy().replace('/', "\\"))
+                .arg(outside.0.join(dir).to_string_lossy().replace('/', "\\"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction setup: {output:?}");
+        }
+        links.push(Link(link));
+    }
+    #[cfg(unix)]
+    {
+        let jar = version.join("1.0.jar");
+        std::os::unix::fs::symlink(outside.0.join("client.jar"), &jar).unwrap();
+        links.push(Link(jar));
+    }
+    let roots = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    drop(links);
+    let moved = roots.launcher.join("linked-minecraft");
+    for path in ["libraries", "assets", "versions/1.0/1.0.jar"] {
+        assert!(fs::symlink_metadata(moved.join(path)).is_err(), "{path}");
+    }
+    assert_eq!(
+        fs::read(moved.join("versions/1.0/1.0.json")).unwrap(),
+        b"{}"
+    );
+    assert_eq!(
+        fs::read(roots.launcher.join("accounts.json")).unwrap(),
+        b"{\"accounts\":[]}"
+    );
+    for dir in ["libraries", "assets"] {
+        assert_eq!(
+            fs::read(outside.0.join(dir).join("sentinel")).unwrap(),
+            b"untouched"
+        );
+    }
+    assert_eq!(fs::read(outside.0.join("client.jar")).unwrap(), b"jar");
+}
+
+/// Links the folder `link` to `target`: a symlink on Unix, a junction on Windows.
+#[cfg(any(unix, windows))]
+fn dir_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "junction setup: {output:?}");
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn server_runtime_moves_with_its_release() {
+    let f = Fixture::new("build");
+    let root = f.source.launcher.join("server-runtime");
+    let files = root.join("game-files/horizon-client");
+    fs::create_dir_all(files.join("1.0")).unwrap();
+    fs::write(files.join("1.0/data"), b"files").unwrap();
+    // Two releases with their links; `current` picks the first, which is not the newest.
+    for tag in ["v1", "v2"] {
+        let release = root.join("releases").join(tag);
+        fs::create_dir_all(release.join(".local")).unwrap();
+        fs::write(release.join("horizon-server"), tag).unwrap();
+        dir_link(&files, &release.join(".local/horizon-client"));
+    }
+    fs::create_dir_all(root.join("releases/v3/.local")).unwrap();
+    fs::write(root.join("current.switching"), b"mine").unwrap();
+    dir_link(&root.join("releases/v1"), &root.join("current"));
+    let roots = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    let moved = roots.launcher.join("server-runtime");
+    let canonical = |path: PathBuf| fs::canonicalize(path).unwrap();
+    assert_eq!(
+        canonical(moved.join("current")),
+        canonical(moved.join("releases/v1"))
+    );
+    assert_eq!(
+        fs::read(moved.join("current/horizon-server")).unwrap(),
+        b"v1"
+    );
+    for tag in ["v1", "v2"] {
+        let local = moved
+            .join("releases")
+            .join(tag)
+            .join(".local/horizon-client");
+        assert_eq!(fs::read(local.join("1.0/data")).unwrap(), b"files");
+        assert_eq!(
+            canonical(local),
+            canonical(moved.join("game-files/horizon-client"))
+        );
+    }
+    assert_eq!(
+        canonical(root.join("current")),
+        canonical(root.join("releases/v1"))
+    );
+    // A release with a plain `.local` gets no link, and a player's own `.switching` file moves.
+    assert!(fs::read_dir(moved.join("releases/v3/.local"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(fs::read(moved.join("current.switching")).unwrap(), b"mine");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn server_runtime_current_elsewhere_is_refused() {
+    let f = Fixture::new("build");
+    let outside = Temp::new();
+    fs::write(outside.0.join("sentinel"), b"untouched").unwrap();
+    // No `releases` folder: `current` is still checked on its own.
+    let root = f.source.launcher.join("server-runtime");
+    fs::create_dir_all(&root).unwrap();
+    dir_link(&outside.0, &root.join("current"));
+    let error = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap_err();
+    assert!(error.contains("a link Horizon did not make"), "{error}");
+    assert_eq!(fs::read(&f.bootstrap).unwrap(), f.pointer);
+    assert_eq!(fs::read(outside.0.join("sentinel")).unwrap(), b"untouched");
+    #[cfg(unix)]
+    fs::remove_file(root.join("current")).unwrap();
+    #[cfg(windows)]
+    fs::remove_dir(root.join("current")).unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_linked_server_runtime_is_refused() {
+    let f = Fixture::new("build");
+    let elsewhere = f.source.launcher.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    dir_link(&elsewhere, &f.source.launcher.join("server-runtime"));
+    let error = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap_err();
+    assert!(error.contains("a link Horizon did not make"), "{error}");
+    assert_eq!(fs::read(&f.bootstrap).unwrap(), f.pointer);
+}
+
+#[cfg(unix)]
+#[test]
+fn server_game_files_through_a_linked_folder_are_refused() {
+    let f = Fixture::new("build");
+    let root = f.source.launcher.join("server-runtime");
+    fs::create_dir_all(root.join("releases/v1/.local")).unwrap();
+    fs::create_dir_all(f.source.launcher.join("elsewhere/horizon-client")).unwrap();
+    // A relative link the copy would keep, so the game files would end outside the runtime.
+    std::os::unix::fs::symlink("../elsewhere", root.join("game-files")).unwrap();
+    dir_link(
+        &root.join("game-files/horizon-client"),
+        &root.join("releases/v1/.local/horizon-client"),
+    );
+    let error = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap_err();
+    assert!(error.contains("a link Horizon did not make"), "{error}");
+    assert_eq!(fs::read(&f.bootstrap).unwrap(), f.pointer);
+}
+
+#[cfg(unix)]
+#[test]
+fn server_links_spelled_through_a_linked_parent_move() {
+    let f = Fixture::new("build");
+    // The launcher spelled its folder through a link above it, as `~/.local/share` can be.
+    let alias = f.temp.0.join("alias");
+    std::os::unix::fs::symlink(f.temp.0.join("source"), &alias).unwrap();
+    let spelled = Roots {
+        launcher: alias.join("launcher"),
+        ..f.source.clone()
+    };
+    let root = spelled.launcher.join("server-runtime");
+    fs::create_dir_all(root.join("releases/v1/.local")).unwrap();
+    fs::create_dir_all(root.join("game-files/horizon-client")).unwrap();
+    dir_link(
+        &root.join("game-files/horizon-client"),
+        &root.join("releases/v1/.local/horizon-client"),
+    );
+    dir_link(&root.join("releases/v1"), &root.join("current"));
+    let roots = migrate(&spelled, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    let moved = roots.launcher.join("server-runtime");
+    assert_eq!(
+        fs::read_link(moved.join("current")).unwrap(),
+        moved.join("releases/v1")
+    );
+}
+
+#[test]
+fn real_files_where_other_launchers_links_go_are_moved() {
+    let f = Fixture::new("build");
+    let linked = f.source.launcher.join("linked-minecraft");
+    for (path, bytes) in [
+        ("assets/indexes/1.json", &b"assets"[..]),
+        ("libraries/a.jar", b"library"),
+        ("versions/1.0/1.0.jar", b"jar"),
+    ] {
+        fs::create_dir_all(linked.join(path).parent().unwrap()).unwrap();
+        fs::write(linked.join(path), bytes).unwrap();
+    }
+    let roots = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    assert_eq!(snapshot(&f.source.launcher), snapshot(&roots.launcher));
+    assert_eq!(snapshot(&linked).len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_inside_the_root_is_made_again() {
+    let f = Fixture::new("build");
+    let runtime = f.source.launcher.join("runtime");
+    fs::create_dir_all(runtime.join("lib")).unwrap();
+    fs::create_dir_all(runtime.join("bin")).unwrap();
+    fs::write(runtime.join("lib/libjvm.so"), b"jvm").unwrap();
+    std::os::unix::fs::symlink("../lib/libjvm.so", runtime.join("bin/libjvm.so")).unwrap();
+    let roots = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap();
+    let link = roots.launcher.join("runtime/bin/libjvm.so");
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("../lib/libjvm.so"));
+    assert_eq!(fs::read(link).unwrap(), b"jvm");
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_leaving_the_root_is_still_refused() {
+    for target in [
+        "../../outside",
+        "lib/../../outside",
+        "./lib",
+        "lib/./a",
+        "lib//a",
+        "lib/",
+        "/etc",
+        "../..",
+    ] {
+        let f = Fixture::new("build");
+        let folder = f.source.launcher.join("runtime");
+        fs::create_dir_all(folder.join("lib")).unwrap();
+        std::os::unix::fs::symlink(target, folder.join("link")).unwrap();
+        let error = migrate(&f.source, &f.target(), &f.bootstrap, |_| {}).unwrap_err();
+        assert!(
+            error.contains("Symbolic links and reparse points"),
+            "{target}: {error}"
+        );
+        assert_eq!(fs::read(&f.bootstrap).unwrap(), f.pointer);
+    }
+}
+
 #[cfg(unix)]
 struct PermissionsGuard(PathBuf, fs::Permissions);
 #[cfg(unix)]

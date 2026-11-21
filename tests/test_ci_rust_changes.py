@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
+from tests.symlinks import symlink_or_skip
 from tools.ci.rust_changes import (
     EMBEDDED, needs_rust_alone, UNKNOWN_CHANGE, changed_entries, changed_paths, mentions_replaceable, needs_launcher, needs_mod_points, needs_rust, needs_server_build, needs_tooling,
     selections,
@@ -151,7 +152,7 @@ class RustChangesTests(unittest.TestCase):
             (docs / "old.md").rename(docs / "renamed.md")
             (docs / "added.md").write_text("added\n")
             (docs / "type.md").unlink()
-            (docs / "type.md").symlink_to("modified.md")
+            symlink_or_skip(docs / "type.md", "modified.md")
             git("add", "-A")
             git(*commit)
             previous = Path.cwd()
@@ -243,7 +244,9 @@ class ModPointSelectionTests(unittest.TestCase):
         for path in ["crates/horizon-client/src/game/tick.rs", "crates/horizon-client/src/game.rs",
                      "crates/horizon-mod-api-gen/src/points.rs", "crates/horizon-mod-api-macros/src/lib.rs",
                      "tools/check_mod_points_unchanged.py", "crates/horizon-world/Cargo.toml", "Cargo.lock",
-                     UNKNOWN_CHANGE, ".github/workflows/ci.yml"]:
+                     UNKNOWN_CHANGE, ".github/workflows/ci.yml", "tools/ci/surface_report.py",
+                     "tools/ci/surface.toml", "crates/horizon-mod-vocab/changes/a-note.toml",
+                     "crates/horizon-core/src/nbt.rs"]:
             with self.subTest(path=path):
                 self.assertTrue(needs_mod_points(["README.md", path]))
 

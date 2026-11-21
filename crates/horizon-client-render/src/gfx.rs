@@ -492,6 +492,7 @@ pub mod entity_skin;
 pub mod external;
 mod flat;
 mod frame_gen;
+pub(crate) mod frame_targets;
 mod frustum;
 mod gpu_culling;
 mod hdr;
@@ -503,6 +504,7 @@ mod in_flight;
 mod material_animate;
 #[cfg(test)]
 mod material_animation_tests;
+pub mod safe_start;
 pub use hdr::{Calibration as HdrCalibration, Output as HdrOutput};
 pub use output::{DisplayReading, EffectiveOutput, FrameConfiguration, FrameRequest};
 
@@ -550,6 +552,8 @@ pub mod pack_uniforms;
 mod pack_weather;
 mod pass_timing_api;
 use pass_timing_api::{after_culling_pass, pixel_count, world_pass_after_culling};
+mod not_drawn;
+pub use not_drawn::NotDrawn;
 mod page_runs;
 pub mod panorama;
 mod readback;
@@ -1459,6 +1463,8 @@ pub struct Renderer {
     /// The visibility buffer for flat frames' solid terrain (`visbuffer`,
     /// `HORIZON_VISBUFFER=1`).
     visbuf: Option<visbuffer::Visbuffer>,
+    /// Hardware task+mesh solid terrain (`mesh_shader`, `HORIZON_MESH_SHADER=1`).
+    mesh_terrain: Option<surface_setup::mesh_shader::MeshTerrain>,
     /// `flat` draws this frame's sections (off: the per-section draws).
     flat_on: bool,
     /// Occlusion culling of solid section draws, where the GPU's instance
@@ -1519,6 +1525,8 @@ pub struct Renderer {
     mirror_globals: wgpu::Buffer,
     mirror_group: wgpu::BindGroup,
     mirror: Option<MirrorTarget>,
+    /// The size the mirror's targets had no room at (#13624): not tried again there.
+    mirror_no_room: Option<[u32; 2]>,
     /// Native mods' world views' targets and pipelines, and the largest side the device gives one.
     world_views: world_views::Kept,
     world_view_side: u32,
@@ -1648,6 +1656,18 @@ pub struct Renderer {
     shrink_gate: ShrinkGate,
     /// Whether `lightmap` holds `lightmap_pixels` yet.
     lightmap_uploaded: bool,
+    /// A window frame was given up after it recorded uploads (#13624): the next one uploads
+    /// what is uploaded only when it changes again (`upload_again`).
+    frame_lost: bool,
+    /// Window frames given up in a row (`frame_given_up`).
+    given_up: u32,
+    /// The last frame went to the submit thread, and whether it was given up there is not
+    /// looked at yet.
+    handed_off: bool,
+    /// That frame's atlas patches, uploaded again where the submit thread gave it up.
+    handed_patches: Vec<crate::font::Patch>,
+    /// The world border's vertices go up on the next frame that draws it, rebuilt or not.
+    border_stale: bool,
     sprite_minimum_size: u32,
     /// Each sprite layer's own side, before the arrays scaled it up (`mipmap::Settings::native_size`).
     sprite_native: Vec<u32>,
@@ -1658,7 +1678,9 @@ pub struct Renderer {
     instances: wgpu::Buffer,
     instance_capacity: u64,
     outline: wgpu::Buffer,
-    depth: wgpu::TextureView,
+    /// `None` while it has no room at the window's size (`remake_depth`): window frames are
+    /// skipped until it does.
+    depth: Option<wgpu::TextureView>,
     sections: resident::Resident<SectionGpu>,
     lods: FxHashMap<crate::lod::TileKey, lod::Tile>,
     /// Far tiles' occlusion culling slots (`lod::Tile::cull_slot`): those
@@ -1853,6 +1875,10 @@ pub struct Renderer {
     readback: readback::Readback,
     pub info: wgpu::AdapterInfo,
     pub suspended: bool,
+    /// Why the last window frame was not drawn; `None` once one is (`not_drawn`).
+    not_drawn: Option<NotDrawn>,
+    /// The reason the frame being drawn names at its way out, for `render` to settle.
+    refusal: Option<NotDrawn>,
     /// Consecutive frames whose surface acquisition failed validation. The
     /// first gets the swapchain a fresh configuration; later ones reattach
     /// the window, as a lost surface does.
@@ -2521,9 +2547,14 @@ impl Renderer {
             ("SPRITE_ARRAYS", f64::from(sprite_arrays)),
             ("SPRITE_SPLIT", f64::from(split)),
         ];
+        let terrain_entries = if surface_setup::mesh_shader::on(&device) {
+            surface_setup::mesh_shader::terrain_entries()
+        } else {
+            native_material::terrain_entries()
+        };
         let bindings = kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Horizon terrain bindings"),
-            entries: &native_material::terrain_entries(),
+            entries: &terrain_entries,
         });
         let layout = kept.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Horizon terrain layout"),
@@ -4264,6 +4295,16 @@ impl Renderer {
                     &sprite_constants,
                 )
             });
+        let mesh_terrain = flat.as_ref().and_then(|f| {
+            surface_setup::mesh_shader::MeshTerrain::new(
+                &device,
+                &bindings,
+                &f.draw_layout,
+                (frame_format, linear_light),
+                &sprite_constants,
+                hdr_output.is_some(),
+            )
+        });
         let multi_draw = device
             .features()
             .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
@@ -4456,6 +4497,7 @@ impl Renderer {
             cull,
             flat,
             visbuf,
+            mesh_terrain,
             sky,
             sky_base,
             sunrise_pipeline,
@@ -4481,6 +4523,7 @@ impl Renderer {
             mirror_globals,
             mirror_group,
             mirror: None,
+            mirror_no_room: None,
             world_views: views,
             world_view_side: max_side,
             entity_pipeline,
@@ -4576,6 +4619,11 @@ impl Renderer {
             section_copy_bytes: 0,
             shrink_gate: ShrinkGate::default(),
             lightmap_uploaded: false,
+            frame_lost: false,
+            given_up: 0,
+            handed_off: false,
+            handed_patches: Vec::new(),
+            border_stale: false,
             sprite_minimum_size,
             sprite_native: sprite_mips.iter().map(|s| s.native_size).collect(),
             mipmap_option: 4,
@@ -4584,7 +4632,7 @@ impl Renderer {
             instances,
             instance_capacity,
             outline,
-            depth,
+            depth: Some(depth),
             sections: resident::Resident::default(),
             lods: FxHashMap::default(),
             lod_cull_free: Vec::new(),
@@ -4679,6 +4727,8 @@ impl Renderer {
             readback: readback::Readback::default(),
             info,
             suspended: !drawable_size(size.width, size.height, max_side),
+            not_drawn: None,
+            refusal: None,
             acquire_validation_failures: 0,
             surface_unconfigured: false,
             drawn_sections: 0,
@@ -4812,6 +4862,70 @@ impl Renderer {
     fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
         rt::query::quad_indices(device, quads)
     }
+
+    /// A window frame was given up (#13624). Where video memory stays full, every frame would
+    /// be: black frames, or the last one held, behind one warning. After `GIVEN_UP_LIMIT` in a
+    /// row the game ends, as running out of memory did before.
+    fn frame_given_up(&mut self) {
+        self.given_up += 1;
+        if self.given_up >= GIVEN_UP_LIMIT {
+            panic!(
+                "Horizon renderer: video memory is full: {GIVEN_UP_LIMIT} frames in a row could                  not be drawn (#13624)"
+            );
+        }
+    }
+    /// After a frame given up whose uploads never reached the GPU (#13624): what frames upload
+    /// only when it changes is uploaded again.
+    fn upload_again(&mut self) {
+        self.lightmap_uploaded = false;
+        self.static_entity_catalog_revision = 0;
+        for section in self.static_entity_sections.values_mut() {
+            section.revision = 0;
+        }
+        self.cloud_mesh.forget();
+        self.border_stale = true;
+        self.animations.forget();
+        self.material_animations.forget();
+        self.hud.forget_pictures();
+        if let Some(gpu) = &mut self.gpu_culling {
+            gpu.forget();
+        }
+        for section in self.sections.values_mut() {
+            section.sort.forget();
+        }
+        for tile in self.lods.values_mut() {
+            for mesh in tile.meshes_mut() {
+                mesh.sort.forget();
+            }
+        }
+    }
+    /// The atlas patches of the frame the submit thread gave up (#13624), uploaded again.
+    fn upload_handed_patches(&mut self) {
+        if self.handed_patches.is_empty() {
+            return;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Horizon atlas patches"),
+            });
+        self.hud
+            .upload_patches(&mut self.uploads, &mut encoder, &self.handed_patches);
+        self.uploads.finish(&encoder);
+        self.queue.submit([encoder.finish()]);
+        self.handed_patches.clear();
+    }
+    /// The index buffer of `quads` quads, for a frame that grows one: `None` where there was no
+    /// room for it (#13624).
+    fn grown_quad_indices(
+        device: &wgpu::Device,
+        queue: &submit::Queue,
+        quads: u32,
+    ) -> Option<wgpu::Buffer> {
+        frame_targets::made(device, frame_targets::Kind::Buffers, || {
+            rt::query::written_quad_indices(device, queue, quads)
+        })
+    }
     fn offscreen_target(
         device: &wgpu::Device,
         config: &wgpu::SurfaceConfiguration,
@@ -4906,6 +5020,19 @@ impl Renderer {
             })
             .create_view(&Default::default())
     }
+    /// Makes the window's depth again at its size. The old one is let go first, occlusion
+    /// culling's binding of it too, so the two are never held together. Without the room for it
+    /// (#13624) there is none, and window frames are skipped until a try finds room.
+    fn remake_depth(&mut self) -> bool {
+        self.depth = None;
+        if let Some(cull) = &mut self.cull {
+            cull.forget_depth();
+        }
+        self.depth = frame_targets::made(&self.device, frame_targets::Kind::Depth, || {
+            Self::depth(&self.device, &self.config)
+        });
+        self.depth.is_some()
+    }
     /// VSync on presents with Fifo, capped to the display's refresh rate in a
     /// window and in fullscreen alike; Horizon's present-mode setting applies
     /// only with VSync off (`window::chosen_present_mode`).
@@ -4953,7 +5080,12 @@ impl Renderer {
         } else {
             self.offscreen = Some(Self::offscreen_target(&self.device, &self.config));
         }
-        self.depth = Self::depth(&self.device, &self.config);
+        self.remake_depth();
+        // Effects that had no room try again at the new size (#13624).
+        self.frame_gen.no_room = false;
+        if let Some(oit) = &mut self.oit {
+            oit.no_room = false;
+        }
         if let Some(pipeline) = &mut self.external {
             pipeline.resize([width, height]);
         }
@@ -5222,6 +5354,11 @@ impl Renderer {
         let mut section = self.upload_mesh(mesh);
         if let Some(s) = section.as_mut().filter(|_| self.ray_looks) {
             s.ray_looks = [&mesh.solid_looks, &mesh.translucent_looks].map(|l| l[..].into());
+        }
+        if let (Some(mesh_terrain), Some(s)) = (&mut self.mesh_terrain, section.as_ref())
+            && s.solid > 0
+        {
+            mesh_terrain.insert_section_mesh(s.page, s.solid_base(), s.packed, &s.sides, mesh);
         }
         let drawn = section.is_some() || facts.empty;
         if drawn {
@@ -5548,6 +5685,11 @@ impl Renderer {
         if let (Some(gpu), Some(id)) = (&mut self.gpu_culling, s.gpu_id) {
             gpu.records.remove(id);
         }
+        if let Some(mesh_terrain) = &mut self.mesh_terrain
+            && s.solid > 0
+        {
+            mesh_terrain.store.remove_section(s.page, s.solid_base());
+        }
         if let Some((page, start)) = s.sorted_indices {
             self.sorted_indices
                 .release(page, start, u64::from(s.translucent) * 6);
@@ -5596,9 +5738,20 @@ impl Renderer {
             .map(|f| (f, &self.device, &mut self.section_uploads));
         // GPU culling's records move with the sections.
         let gpu = self.gpu_culling.as_mut().map(|g| &mut g.records);
+        let meshlets = self.mesh_terrain.as_mut().map(|m| &mut m.store);
         let split = self.translucent_arena.is_some();
         let (arena, part) = (&mut self.arena, Part::Section { split });
-        if !move_off_page(arena, encoder, flat, gpu, meshes, page, part, &mut budget) {
+        if !off_page::move_off_page_with_meshlets(
+            arena,
+            encoder,
+            flat,
+            gpu,
+            meshlets,
+            meshes,
+            page,
+            part,
+            &mut budget,
+        ) {
             // The other pages have no room after all.
             arena.reopen();
         }
@@ -5863,6 +6016,9 @@ impl Renderer {
         }
         if let Some(flat) = &mut self.flat {
             flat.clear();
+        }
+        if let Some(mesh_terrain) = &mut self.mesh_terrain {
+            mesh_terrain.store.clear();
         }
         self.graveyard.add(self.sorted_indices.clear());
         self.translucency_cursor = 0;
@@ -6135,6 +6291,11 @@ impl Renderer {
         if let Some(gpu) = &mut self.gpu_culling {
             gpu.records
                 .remove_all(released.iter().filter_map(|s| s.gpu_id));
+        }
+        if let Some(mesh_terrain) = &mut self.mesh_terrain {
+            for s in released.iter().filter(|s| s.solid > 0) {
+                mesh_terrain.store.remove_section(s.page, s.solid_base());
+            }
         }
         self.sorted_indices
             .release_all(released.iter().filter_map(|s| {
@@ -7205,10 +7366,14 @@ impl Renderer {
             self.capture_result = Some(result.map_err(|e| e.to_string()));
         }
         let scaled = self.screenshot_size();
+        self.refusal = None;
         let rendered = match scaled {
             Some(size) => self.draw_scaled_frame(frame, size),
             None => self.draw_frame(frame, None, self.output),
         };
+        // As `render` answers the game below: a scaled screenshot's frame never reached the window.
+        let refusal = self.refusal.take();
+        self.not_drawn = NotDrawn::settle(self.not_drawn, refusal, &rendered, scaled.is_some());
         self.finish_prepared_frame();
         // A frame that was not drawn still submits the section copies and
         // atlas patches (glyphs, skins, maps), which the caller already took.
@@ -7237,6 +7402,15 @@ impl Renderer {
         }
         // A scaled screenshot's frame never reached the window.
         rendered.map(|drawn| drawn && scaled.is_none())
+    }
+    /// Why the last frame was not drawn; `None` when it was (#19436).
+    pub fn not_drawn(&self) -> Option<NotDrawn> {
+        self.not_drawn
+    }
+    /// A frame's way out before it was drawn, named.
+    fn refuse(&mut self, why: NotDrawn) -> Result<bool> {
+        self.refusal = Some(why);
+        Ok(false)
     }
     /// Whether the device's loss callback has fired. A surface reconfigure
     /// alone cannot restore resources belonging to a lost device.
@@ -7297,7 +7471,7 @@ impl Renderer {
                 size[1]
             );
             self.screenshot_halvings += 1;
-            return Ok(false);
+            return self.refuse(NotDrawn::ScreenshotNoMemory);
         }
         let scale = self.world_post.scale;
         self.world_post.scale = scale / scale.max(1.0);
@@ -7309,9 +7483,11 @@ impl Renderer {
         let surface = self.surface.take();
         let hdr = self.hdr.take_if(|_| !layered);
         let offscreen = std::mem::replace(&mut self.offscreen, target);
-        let window_depth = std::mem::replace(&mut self.depth, depth);
+        let window_depth = self.depth.replace(depth);
         // The frame's own targets at `size` can run out of memory too.
-        let drawn = self.draw_frame(frame, Some(GpuChecks::push(&self.device)), output);
+        let drawn = frame_targets::in_screenshot(|| {
+            self.draw_frame(frame, Some(GpuChecks::push(&self.device)), output)
+        });
         self.depth = window_depth;
         self.offscreen = offscreen;
         match hdr {
@@ -7345,6 +7521,24 @@ impl Renderer {
         // Waiting for the previous frame (offscreen: at most two on the GPU), not work.
         let landed = landing.elapsed();
         self.queue.take_waited();
+        // The last frame, landed now, given up on the submit thread or not (#13624).
+        if self.queue.copies_lost() {
+            panic!(
+                "Horizon renderer: video memory is full: the section copies could not be                  submitted, and their terrain cannot be drawn again (#13624)"
+            );
+        }
+        let lost_there = self.queue.take_lost();
+        if std::mem::take(&mut self.handed_off) && !lost_there {
+            self.given_up = 0;
+        }
+        if lost_there {
+            self.upload_handed_patches();
+            self.frame_lost = true;
+            self.frame_given_up();
+        }
+        if std::mem::take(&mut self.frame_lost) {
+            self.upload_again();
+        }
         // World frames alone follow the shader pack: the game loads the picked one
         // before it draws one. Title frames draw no terrain and keep the layout
         // through a pack dropped (Shader Options) or not loaded yet (`Renderer::new`),
@@ -7370,8 +7564,55 @@ impl Renderer {
                 None => self.arena.has_page(key),
             });
         }
+        if let Some(mesh_terrain) = &mut self.mesh_terrain {
+            mesh_terrain.store.trim(|page| self.arena.has_page(page));
+        }
         if self.suspended {
-            return Ok(false);
+            return self.refuse(NotDrawn::Suspended);
+        }
+        // A window frame without the room for a target it draws into is skipped before it takes
+        // a swapchain image, and tried again on the next (#13624). A scaled screenshot's frame
+        // is under its own scopes (`checks`), which take it again at half the size.
+        if checks.is_none() {
+            frame_targets::begin_frame();
+            if self.depth.is_none() && !self.remake_depth() {
+                self.frame_given_up();
+                return self.refuse(NotDrawn::NoRoom);
+            }
+            let size = [self.config.width, self.config.height];
+            if let Some(hdr) = &mut self.hdr
+                && !hdr.ready(&self.device, size)
+            {
+                self.frame_given_up();
+                return self.refuse(NotDrawn::NoRoom);
+            }
+            // Without HDR, the texture a float frame or a screenshot of a swapchain that can't
+            // be copied from is drawn into, for the image the swapchain was configured to give.
+            let image = match &self.offscreen {
+                _ if self.surface.is_some() => Some(readback::Image {
+                    size: wgpu::Extent3d {
+                        width: self.config.width,
+                        height: self.config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    format: self.config.format,
+                    usage: self.config.usage,
+                }),
+                Some(offscreen) => Some(readback::Image {
+                    size: offscreen.size(),
+                    format: offscreen.format(),
+                    usage: offscreen.usage(),
+                }),
+                None => None,
+            };
+            let (format, screenshot) = (self.output.frame.format, self.screenshot.is_some());
+            if self.hdr.is_none()
+                && let Some(image) = image
+                && !self.readback.ready(&self.device, image, format, screenshot)
+            {
+                self.frame_given_up();
+                return self.refuse(NotDrawn::NoRoom);
+            }
         }
         let started = Instant::now();
         if self.first_frame == FirstFrame::Acquire {
@@ -7397,7 +7638,7 @@ impl Renderer {
             )
             .is_err()
             {
-                return Ok(false);
+                return self.refuse(NotDrawn::Unconfigured);
             }
             self.surface_unconfigured = false;
         }
@@ -7407,7 +7648,7 @@ impl Renderer {
         // passes, HDR output without the HUD's layer (or the float frame HDR was started
         // with) or the title screen.
         let fg = self.frame_gen.on
-            && !(self.frame_gen.paused || self.frame_gen.refused)
+            && !(self.frame_gen.paused || self.frame_gen.refused || self.frame_gen.no_room)
             && (self.hdr.as_ref()).map_or(
                 self.output.frame.format == self.config.format.remove_srgb_suffix(),
                 hdr::Hdr::layered,
@@ -7424,18 +7665,33 @@ impl Renderer {
         // Waits for the submit thread since the last frame's present (this frame's uploads).
         let queued = self.queue.take_waited();
         let acquire = Instant::now();
-        let fg_frames = fg
-            .then(|| {
-                self.frame_gen.frames(
-                    &self.device,
+        // Its frames and world target are made here, before the frame is drawn: without the room
+        // for them (#13624) frame generation is off until the surface is configured again.
+        let fg_frames = if fg {
+            let config = self.surface_config();
+            let format = self.output.frame.format;
+            let (device, frame_gen) = (&self.device, &mut self.frame_gen);
+            let made = frame_targets::made(device, frame_targets::Kind::FrameGeneration, || {
+                let frames = frame_gen.frames(
+                    device,
                     &self.queue,
                     self.surface.as_ref(),
                     self.offscreen.as_ref(),
                     &self.window,
-                    &self.surface_config(),
-                )
-            })
-            .flatten();
+                    &config,
+                );
+                if frames.is_some() {
+                    frame_gen.world(device, &self.world_post, &self.config, format);
+                }
+                frames
+            });
+            if made.is_none() {
+                self.frame_gen.out_of_room();
+            }
+            made.flatten()
+        } else {
+            None
+        };
         // The present thread failed: this frame acquires as without frame generation.
         let fg = fg_frames.is_some();
         let mut fg_made = false;
@@ -7451,16 +7707,19 @@ impl Renderer {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
-            Some(wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded) => {
-                return Ok(false);
+            Some(wgpu::CurrentSurfaceTexture::Timeout) => {
+                return self.refuse(NotDrawn::AcquireTimeout);
+            }
+            Some(wgpu::CurrentSurfaceTexture::Occluded) => {
+                return self.refuse(NotDrawn::Occluded);
             }
             Some(wgpu::CurrentSurfaceTexture::Outdated) => {
                 self.configure_surface();
-                return Ok(false);
+                return self.refuse(NotDrawn::Outdated);
             }
             Some(wgpu::CurrentSurfaceTexture::Lost) => {
                 self.recreate_surface()?;
-                return Ok(false);
+                return self.refuse(NotDrawn::Lost);
             }
             Some(wgpu::CurrentSurfaceTexture::Validation) => {
                 // Acquire caught a validation error: the swapchain cannot be
@@ -7476,13 +7735,18 @@ impl Renderer {
                 }
                 self.acquire_validation_failures =
                     self.acquire_validation_failures.saturating_add(1);
-                return Ok(false);
+                return self.refuse(NotDrawn::Validation);
             }
         };
         if surface_frame.is_some() {
             self.acquire_validation_failures = 0;
             self.frame_gen.paused = false;
         }
+        // A window frame's own scopes, read before its commands are finished (`frame_lost`):
+        // where something no fallback of its own covers runs out of memory (#13624), the frame
+        // is given up rather than submitted with what failed. Native error scopes resolve at
+        // once.
+        let backstop = checks.is_none().then(|| GpuChecks::push(&self.device));
         let size = [self.config.width, self.config.height];
         let target_texture = match (&surface_frame, &mut self.hdr) {
             (_, Some(hdr)) => hdr.frame(&self.device, size),
@@ -7505,17 +7769,14 @@ impl Renderer {
                     .unwrap_or(image)
             }
         };
-        // One command buffer for the frame, after the section copies staged
-        // since the last one: Metal commits every command buffer wgpu-core
-        // makes (one per run of copies and two per pass) on its own.
-        let section_copies = self.section_copies.take();
-        let has_section_copies = section_copies.is_some();
-        let mut encoder = section_copies.unwrap_or_else(|| {
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Horizon frame"),
-                })
-        });
+        // The section copies staged since the last frame, in a command buffer of their own
+        // submitted before the frame's: a frame given up (`abandon_frame`) still submits them.
+        let mut copies = self.take_section_copies();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Horizon frame"),
+            });
         // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
         if self.own_timing.is_some() != self.pass_timing {
             self.own_timing = self
@@ -8078,16 +8339,25 @@ impl Renderer {
         let listed = visible.len() + visible_lods.len();
         let viewed = listed + shadow_visible.len();
         let instances = viewed + self.world_views.sections.sections().count();
+        // A buffer a frame grows keeps the old one until the new one is made (#13624): without
+        // the room for it, the frame is given up and nothing is recorded with what failed.
         if instances as u64 > self.instance_capacity {
-            self.instance_capacity = (instances as u64).next_power_of_two();
-            self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Section origins"),
-                size: self.instance_capacity * 16,
-                usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
+            let capacity = (instances as u64).next_power_of_two();
+            let usage = wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE;
+            let made = frame_targets::buffer(&self.device, "Section origins", capacity * 16, usage);
+            let Some(buffer) = made else {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            };
+            self.instance_capacity = capacity;
+            self.instances = buffer;
         }
         self.origins.clear();
         let (sections, retiring) = (&self.sections, &self.lod_retiring);
@@ -8573,13 +8843,20 @@ impl Renderer {
         if debug_depth + debug_top + crosshair > 0 {
             let needed = u64::from(debug_depth + debug_top + crosshair);
             if needed > self.debug_line_capacity {
-                self.debug_line_capacity = needed.next_power_of_two();
-                self.debug_line_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Debug lines"),
-                    size: 32 * self.debug_line_capacity,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                let capacity = needed.next_power_of_two();
+                let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                let made = frame_targets::buffer(&self.device, "Debug lines", 32 * capacity, usage);
+                let Some(buffer) = made else {
+                    return self.abandon_frame(frame_targets::Abandoned::grown(
+                        encoder,
+                        copies,
+                        surface_frame,
+                        fg_frames,
+                        backstop,
+                    ));
+                };
+                self.debug_line_capacity = capacity;
+                self.debug_line_buffer = buffer;
             }
             let lines = &mut self.debug_lines_scratch;
             lines.clear();
@@ -8722,9 +8999,64 @@ impl Renderer {
             );
             entities = &self.pack_entity_rest;
         }
+        // The world's targets: the screen, or the scaled target of `post`.
+        let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
+        // One of Horizon's own packs reads the same world target.
+        let native_post = !frame.title && self.executor.is_some();
+        let pack_reads_world = pack_post || native_post;
+        // Before the frame chooses how it draws translucent things: the world's size decides
+        // whether improved transparency has the room for its targets.
+        let scaled = self.world_post.prepare(
+            &self.device,
+            [self.config.width, self.config.height],
+            pack_reads_world || fg || msaa_on,
+            pack_post,
+        );
         // GameRenderer.useImprovedTransparency. A shader pack keeps its own
-        // path.
-        let oit_on = !frame.title && self.improved_transparency_runs();
+        // path. Without the room for its targets (#13624) this frame draws translucent things
+        // the ordinary way.
+        let mut oit_on = !frame.title && self.improved_transparency_runs();
+        if oit_on {
+            let size = self
+                .world_post
+                .size()
+                .filter(|_| scaled.is_some())
+                .unwrap_or([self.config.width, self.config.height]);
+            let (device, layout, sprites) =
+                (&self.device, &self.terrain_layout, self.terrain_sprites);
+            let clouds = [0, 1].map(|i| self.cloud_pipeline.get_bind_group_layout(i));
+            let format = self.output.frame.format;
+            let flat = self
+                .flat
+                .as_ref()
+                .map(|f| f.translucent.get_bind_group_layout(1));
+            let features = [
+                self.entity_pipeline.get_bind_group_layout(0),
+                self.weather.pipeline().get_bind_group_layout(1),
+                self.border_pipeline.get_bind_group_layout(0),
+            ];
+            oit_on = self
+                .oit
+                .get_or_insert_with(|| {
+                    oit::Oit::new(
+                        device,
+                        layout,
+                        flat.as_ref(),
+                        [&features[0], &features[1], &features[2]],
+                        [&clouds[0], &clouds[1]],
+                        sprites,
+                        format,
+                    )
+                })
+                .fit(&self.device, size);
+        }
+        // Off for want of room (#13624): its targets are let go until the size changes.
+        if !oit_on
+            && let Some(oit) = &mut self.oit
+            && oit.no_room
+        {
+            oit.let_go();
+        }
         self.cracks_transparent = oit_on && !hdr_gain;
         let [
             entity_quads,
@@ -8793,13 +9125,23 @@ impl Renderer {
             let vertices = self.cloud_mesh.vertices.len() as u64;
             if rebuilt && vertices > 0 {
                 if vertices > self.cloud_capacity {
-                    self.cloud_capacity = vertices.next_power_of_two();
-                    self.cloud_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Cloud vertices"),
-                        size: self.cloud_capacity * std::mem::size_of::<Vertex>() as u64,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                    let capacity = vertices.next_power_of_two();
+                    let size = capacity * std::mem::size_of::<Vertex>() as u64;
+                    let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                    let made = frame_targets::buffer(&self.device, "Cloud vertices", size, usage);
+                    let Some(buffer) = made else {
+                        // The mesh is uploaded again once there is room.
+                        self.cloud_mesh.forget();
+                        return self.abandon_frame(frame_targets::Abandoned::grown(
+                            encoder,
+                            copies,
+                            surface_frame,
+                            fg_frames,
+                            backstop,
+                        ));
+                    };
+                    self.cloud_capacity = capacity;
+                    self.cloud_buffer = buffer;
                 }
                 self.uploads.buffer(
                     &mut encoder,
@@ -8849,13 +9191,21 @@ impl Renderer {
         let outlined = skin.map_or(0, |s| s.outline_vertices);
         let entity_vertices = u64::from(outline_base) + u64::from(outlined);
         if entity_vertices > self.entity_capacity {
-            self.entity_capacity = entity_vertices.next_power_of_two();
-            self.entity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Entity vertices"),
-                size: self.entity_capacity * std::mem::size_of::<Vertex>() as u64,
-                usage: self.entity_usage(),
-                mapped_at_creation: false,
-            });
+            let capacity = entity_vertices.next_power_of_two();
+            let size = capacity * std::mem::size_of::<Vertex>() as u64;
+            let usage = self.entity_usage();
+            let made = frame_targets::buffer(&self.device, "Entity vertices", size, usage);
+            let Some(buffer) = made else {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            };
+            self.entity_capacity = capacity;
+            self.entity_buffer = buffer;
         }
         if !all_entities.is_empty() {
             self.uploads.buffer(
@@ -8878,16 +9228,22 @@ impl Renderer {
             self.device.limits().max_buffer_size,
         )?;
         if slots > self.prepared_instance_capacity {
-            let checks = GpuChecks::push(&self.device);
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Prepared model instances"),
-                size: slots * stride,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            if let Some(error) = checks.pop() {
-                return Err(error.to_string().into());
-            }
+            let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+            let made = frame_targets::buffer(
+                &self.device,
+                "Prepared model instances",
+                slots * stride,
+                usage,
+            );
+            let Some(buffer) = made else {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            };
             self.prepared_instance_buffer = buffer;
             self.prepared_instance_capacity = slots;
         }
@@ -8956,43 +9312,66 @@ impl Renderer {
                     .binary_search_by_key(section, |snapshot| snapshot.section)
                     .is_ok()
             });
+            // A section without the room for its buffers (#13624) keeps what it had and is
+            // uploaded again on a later frame: the catalog's revision waits for it.
+            let mut missed = false;
+            // Unmapped and written through the queue: a buffer mapped at creation that found no
+            // room panics instead of reporting it.
+            let origin = |device: &wgpu::Device, queue: &submit::Queue, origin: &[i32; 3]| {
+                frame_targets::made(device, frame_targets::Kind::Buffers, || {
+                    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Static block-entity section origin"),
+                        size: std::mem::size_of_val(origin) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(origin));
+                    buffer
+                })
+            };
+            let vertex_buffer = |device: &wgpu::Device, capacity: u64| {
+                frame_targets::buffer(
+                    device,
+                    "Static block-entity section vertices",
+                    capacity * std::mem::size_of::<Vertex>() as u64,
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                )
+            };
             for snapshot in static_sections {
                 let vertices = snapshot.vertices.len() as u64;
-                let gpu = self
-                    .static_entity_sections
-                    .entry(snapshot.section)
-                    .or_insert_with(|| {
-                        let capacity = vertices.next_power_of_two().max(4);
-                        let origin_buffer =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("Static block-entity section origin"),
-                                    contents: bytemuck::bytes_of(&snapshot.origin),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
-                        static_bytes_uploaded += std::mem::size_of_val(&snapshot.origin) as u64;
+                if !self.static_entity_sections.contains_key(&snapshot.section) {
+                    let capacity = vertices.next_power_of_two().max(4);
+                    let (Some(origin_buffer), Some(buffer)) = (
+                        origin(&self.device, &self.queue, &snapshot.origin),
+                        vertex_buffer(&self.device, capacity),
+                    ) else {
+                        missed = true;
+                        continue;
+                    };
+                    static_bytes_uploaded += std::mem::size_of_val(&snapshot.origin) as u64;
+                    self.static_entity_sections.insert(
+                        snapshot.section,
                         GpuStaticEntitySection {
-                            buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("Static block-entity section vertices"),
-                                size: capacity * std::mem::size_of::<Vertex>() as u64,
-                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                                mapped_at_creation: false,
-                            }),
+                            buffer,
                             origin_buffer,
                             origin: snapshot.origin,
                             capacity,
                             revision: 0,
                             vertices: 0,
-                        }
-                    });
+                        },
+                    );
+                }
+                let gpu = self
+                    .static_entity_sections
+                    .get_mut(&snapshot.section)
+                    .expect("made above");
                 if gpu.origin != snapshot.origin {
-                    gpu.origin_buffer =
-                        self.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("Static block-entity section origin"),
-                                contents: bytemuck::bytes_of(&snapshot.origin),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
+                    let Some(origin_buffer) = origin(&self.device, &self.queue, &snapshot.origin)
+                    else {
+                        missed = true;
+                        continue;
+                    };
+                    gpu.origin_buffer = origin_buffer;
                     gpu.origin = snapshot.origin;
                     static_bytes_uploaded += std::mem::size_of_val(&snapshot.origin) as u64;
                 }
@@ -9000,13 +9379,13 @@ impl Renderer {
                     continue;
                 }
                 if vertices > gpu.capacity {
-                    gpu.capacity = vertices.next_power_of_two();
-                    gpu.buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Static block-entity section vertices"),
-                        size: gpu.capacity * std::mem::size_of::<Vertex>() as u64,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                    let capacity = vertices.next_power_of_two();
+                    let Some(buffer) = vertex_buffer(&self.device, capacity) else {
+                        missed = true;
+                        continue;
+                    };
+                    gpu.capacity = capacity;
+                    gpu.buffer = buffer;
                 }
                 self.uploads.buffer(
                     &mut encoder,
@@ -9018,7 +9397,9 @@ impl Renderer {
                 gpu.revision = snapshot.revision;
                 gpu.vertices = vertices as u32;
             }
-            self.static_entity_catalog_revision = catalog_revision;
+            if !missed {
+                self.static_entity_catalog_revision = catalog_revision;
+            }
         }
         let static_entity_quads = frame
             .visible_static_block_entity_sections
@@ -9034,9 +9415,18 @@ impl Renderer {
             .max()
             .unwrap_or(0);
         if max_static_section_quads > self.static_entity_index_quads {
-            self.static_entity_index_quads = max_static_section_quads.next_power_of_two();
-            self.static_entity_indices =
-                Self::quad_indices(&self.device, self.static_entity_index_quads);
+            let quads = max_static_section_quads.next_power_of_two();
+            let Some(indices) = Self::grown_quad_indices(&self.device, &self.queue, quads) else {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            };
+            self.static_entity_index_quads = quads;
+            self.static_entity_indices = indices;
         }
         if !frame.visible_static_block_entity_sections.is_empty()
             && self.static_entity_camera != Some(frame.camera)
@@ -9114,11 +9504,21 @@ impl Renderer {
                 .max(frame.glowing.len() as u32 / 4)
                 .max(outlined / 4);
         if max_quads > self.index_quads {
-            self.index_quads = max_quads.next_power_of_two();
-            self.indices = Self::quad_indices(&self.device, self.index_quads);
+            let quads = max_quads.next_power_of_two();
+            let Some(indices) = Self::grown_quad_indices(&self.device, &self.queue, quads) else {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            };
+            self.index_quads = quads;
+            self.indices = indices;
         }
         if let Some(b) = &frame.border {
-            if b.rebuilt {
+            if b.rebuilt || std::mem::take(&mut self.border_stale) {
                 self.uploads.buffer(
                     &mut encoder,
                     &self.border_vertices,
@@ -9151,14 +9551,23 @@ impl Renderer {
             vertices.clear();
             vertices.extend(frame.screen.iter().flat_map(|q| q.vertices));
             if vertices.len() as u64 > self.screen_capacity {
-                self.screen_capacity = (vertices.len() as u64).next_power_of_two();
-                self.screen_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Screen effect vertices"),
-                    size: self.screen_capacity
-                        * std::mem::size_of::<crate::screen_effects::ScreenVertex>() as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                let capacity = (vertices.len() as u64).next_power_of_two();
+                let size =
+                    capacity * std::mem::size_of::<crate::screen_effects::ScreenVertex>() as u64;
+                let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                let made =
+                    frame_targets::buffer(&self.device, "Screen effect vertices", size, usage);
+                let Some(buffer) = made else {
+                    return self.abandon_frame(frame_targets::Abandoned::grown(
+                        encoder,
+                        copies,
+                        surface_frame,
+                        fg_frames,
+                        backstop,
+                    ));
+                };
+                self.screen_capacity = capacity;
+                self.screen_buffer = buffer;
             }
             self.uploads.buffer(
                 &mut encoder,
@@ -9240,6 +9649,48 @@ impl Renderer {
             }
             _ => false,
         };
+        let mesh_frame = self.mesh_terrain.is_some()
+            && self.flat.is_some()
+            && self.visbuf.is_none()
+            && !gpu_frame
+            && !culling
+            && !msaa_on
+            && !frame.title
+            && !pack_terrain
+            && !self.terrain_looks
+            && self.external.is_none()
+            && shadow_view.is_none()
+            && self.lods.is_empty()
+            && !self.own_timing.as_ref().is_some_and(|t| t.counters_frame());
+        if mesh_frame
+            && !flat_frame
+            && let Some(flat) = &mut self.flat
+        {
+            let sections = &self.sections;
+            let written = flat.write_origins(
+                &self.device,
+                &mut encoder,
+                &mut self.uploads,
+                visible.iter().filter_map(|v| {
+                    let section = sections.get(v.slot);
+                    let code = fade_code(section, &v.key);
+                    Some((
+                        section.flat_id?,
+                        section_instance(v.origin, code, visibility(v.key)),
+                    ))
+                }),
+            );
+            // No room to grow the origins (#13624): the mesh draws would read past them.
+            if !written {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            }
+        }
         // Each page's group binds the page for the solid draws, flat or not.
         if let Some(looks) = &mut self.look_groups {
             looks.refresh(&self.device, &self.arena, self.translucent_arena.as_ref());
@@ -9255,13 +9706,21 @@ impl Renderer {
             section_draw_calls = self.flat.as_ref().map_or(0, |f| f.shadow_calls[0]);
         } else if self.multi_draw && !self.draws.is_empty() {
             if self.draws.len() as u64 > self.indirect_capacity {
-                self.indirect_capacity = (self.draws.len() as u64).next_power_of_two();
-                self.indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Section draws"),
-                    size: self.indirect_capacity * 20,
-                    usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+                let capacity = (self.draws.len() as u64).next_power_of_two();
+                let usage = wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST;
+                let made =
+                    frame_targets::buffer(&self.device, "Section draws", capacity * 20, usage);
+                let Some(buffer) = made else {
+                    return self.abandon_frame(frame_targets::Abandoned::grown(
+                        encoder,
+                        copies,
+                        surface_frame,
+                        fg_frames,
+                        backstop,
+                    ));
+                };
+                self.indirect_capacity = capacity;
+                self.indirect = buffer;
             }
             self.uploads.buffer(
                 &mut encoder,
@@ -9269,6 +9728,32 @@ impl Renderer {
                 0,
                 bytemuck::cast_slice(&self.draws),
             );
+        }
+        if mesh_frame && let Some(mesh_terrain) = &mut self.mesh_terrain {
+            let eye_xyz = eye.map_or([0.0; 3], |e| e.to_array());
+            let low_y = mirror_low.unwrap_or(eye_xyz[1]).min(eye_xyz[1]);
+            let mesh_calls = mesh_terrain.prepare_frame(
+                &self.device,
+                &self.queue,
+                self.arena.page_buffers().map(|(page, _)| page),
+                view.planes.map(|p| p.to_array()),
+                [eye_xyz[0], eye_xyz[1], eye_xyz[2], low_y],
+                eye.is_none(),
+            );
+            let translucent_calls = if flat_frame {
+                self.flat
+                    .as_ref()
+                    .map_or(0, |f| f.translucent_calls().len())
+            } else if self.multi_draw && self.info.backend != wgpu::Backend::Metal {
+                (solid_draws as usize..section_draws)
+                    .filter(|&i| {
+                        i == solid_draws as usize || self.draw_pages[i] != self.draw_pages[i - 1]
+                    })
+                    .count()
+            } else {
+                translucent_draws as usize
+            };
+            section_draw_calls = mesh_calls + translucent_calls;
         }
         let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.output.frame.format),
@@ -9286,12 +9771,7 @@ impl Renderer {
         } else {
             self.show_stats(serial, cpu);
         }
-        // The world's targets: the screen, or the scaled target of `post`.
-        let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
-        // One of Horizon's own packs reads the same world target.
-        let native_post = !frame.title && self.executor.is_some();
         self.set_up_pack_timing();
-        let pack_reads_world = pack_post || native_post;
         laps.lap("r_uploads");
         self.ray_prepare(&mut encoder, camera, frame);
         // Phase 2 of occlusion culling draws over the depth, and a shader pack or TAA reads it.
@@ -9350,15 +9830,9 @@ impl Renderer {
                 .as_ref()
                 .and_then(|p| p.1.as_ref())
                 .is_some_and(|p| p.has_weather());
-        let scaled = self.world_post.prepare(
-            &self.device,
-            [self.config.width, self.config.height],
-            pack_reads_world || fg || msaa_on,
-            pack_post,
-        );
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
-            None => (&view_target, &self.depth),
+            None => (&view_target, self.depth.as_ref().expect(WINDOW_DEPTH)),
         };
         if culling && let Some(cull) = &mut self.cull {
             cull.bind_depth(&self.device, world_depth);
@@ -9373,44 +9847,13 @@ impl Renderer {
             // Frame generation draws the hand over the real and the made frame after the world.
             && fg_frames.is_none()
             && !native_render::world_drawn_hooked();
-        if oit_on {
-            let size = self
-                .world_post
-                .size()
-                .filter(|_| scaled.is_some())
-                .unwrap_or([self.config.width, self.config.height]);
-            let (device, layout, sprites) =
-                (&self.device, &self.terrain_layout, self.terrain_sprites);
-            let clouds = [0, 1].map(|i| self.cloud_pipeline.get_bind_group_layout(i));
-            let format = self.output.frame.format;
-            let flat = self
-                .flat
-                .as_ref()
-                .map(|f| f.translucent.get_bind_group_layout(1));
-            let features = [
-                self.entity_pipeline.get_bind_group_layout(0),
-                self.weather.pipeline().get_bind_group_layout(1),
-                self.border_pipeline.get_bind_group_layout(0),
-            ];
-            self.oit
-                .get_or_insert_with(|| {
-                    oit::Oit::new(
-                        device,
-                        layout,
-                        flat.as_ref(),
-                        [&features[0], &features[1], &features[2]],
-                        [&clouds[0], &clouds[1]],
-                        sprites,
-                        format,
-                    )
-                })
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    size,
-                    &views.primary().projection,
-                    [water_mask_quads > 0, cloud_quads > 0],
-                );
+        if oit_on && let Some(oit) = &mut self.oit {
+            oit.prepare(
+                &self.device,
+                &self.queue,
+                &views.primary().projection,
+                [water_mask_quads > 0, cloud_quads > 0],
+            );
         }
         let oit = self.oit.as_ref().filter(|_| oit_on);
         let cull = self.cull.as_ref().filter(|_| culling && solid_draws > 0);
@@ -9521,7 +9964,12 @@ impl Renderer {
                 .filter(|_| scaled.is_some())
                 .unwrap_or([self.config.width, self.config.height]);
             let size = native_post::reflection_size(world);
-            if self.mirror.as_ref().is_none_or(|m| m.size != size) {
+            // Without the room for its targets (#13624) water draws without the reflection;
+            // the old ones go first, and that size is not tried again.
+            if self.mirror.as_ref().is_none_or(|m| m.size != size)
+                && self.mirror_no_room != Some(size)
+            {
+                self.mirror = None;
                 let target = |label: &'static str, format, usage| {
                     self.device
                         .create_texture(&wgpu::TextureDescriptor {
@@ -9540,20 +9988,24 @@ impl Renderer {
                         })
                         .create_view(&Default::default())
                 };
-                self.mirror = Some(MirrorTarget {
-                    size,
-                    color: target(
-                        "Water mirror",
-                        self.output.frame.format,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::TEXTURE_BINDING,
-                    ),
-                    depth: target(
-                        "Water mirror depth",
-                        wgpu::TextureFormat::Depth32Float,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    ),
-                });
+                self.mirror =
+                    frame_targets::made(&self.device, frame_targets::Kind::Mirror, || {
+                        MirrorTarget {
+                            size,
+                            color: target(
+                                "Water mirror",
+                                self.output.frame.format,
+                                wgpu::TextureUsages::RENDER_ATTACHMENT
+                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                            ),
+                            depth: target(
+                                "Water mirror depth",
+                                wgpu::TextureFormat::Depth32Float,
+                                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            ),
+                        }
+                    });
+                self.mirror_no_room = self.mirror.is_none().then_some(size);
             }
             if let Some(mirror) = &self.mirror {
                 // Mirrored about y = `plane` (camera-relative).
@@ -9692,7 +10144,7 @@ impl Renderer {
             .filter(|_| !pack_draws_terrain);
         // Solid terrain through the visibility buffer (`visbuffer`): flat frames without a
         // pack drawing terrain, a material stage, a surface target or a shadow pass.
-        let vis_frame = flat_frame
+        let mut vis_frame = flat_frame
             && !msaa_on
             && !frame.title
             && !pack_terrain
@@ -9707,7 +10159,8 @@ impl Renderer {
             && self.visbuf.is_some();
         if vis_frame && let (Some(vis), Some(flat)) = (&mut self.visbuf, &self.flat) {
             let depth = world_depth.texture();
-            vis.fit(&self.device, [depth.width(), depth.height()], flat);
+            // Without the room for its IDs (#13624) solid terrain draws as without it.
+            vis_frame = vis.fit(&self.device, [depth.width(), depth.height()], flat);
         }
         {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -9886,7 +10339,7 @@ impl Renderer {
             match self
                 .flat
                 .as_ref()
-                .filter(|_| flat_frame && !pack_draws_terrain)
+                .filter(|_| (flat_frame || mesh_frame) && !pack_draws_terrain)
             {
                 _ if pack_draws_terrain => {
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -9935,6 +10388,18 @@ impl Renderer {
                     );
                     pass.set_bind_group(0, &self.group, &[]);
                     pack_frame(&mut pass);
+                    pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                }
+                Some(flat) if mesh_frame => {
+                    let mesh_terrain = self.mesh_terrain.as_ref().expect("a mesh shader frame");
+                    pass.stage(self.own_timing.as_mut(), "solid terrain");
+                    mesh_terrain.draw_solid(
+                        &mut pass,
+                        flat,
+                        self.arena.page_buffers().map(|(page, _)| page),
+                        hdr,
+                    );
+                    pass.set_bind_group(0, &self.group, &[]);
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                 }
                 Some(flat) => {
@@ -11039,7 +11504,7 @@ impl Renderer {
             self.draw_world_views(&mut encoder, frame, globals, flat_frame, entity_quads);
             let (depth, depth_size) = match &scaled {
                 Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
-                None => (&self.depth, size),
+                None => (self.depth.as_ref().expect(WINDOW_DEPTH), size),
             };
             native_render::world_drawn(&mut native_render::WorldDrawn {
                 device: &self.device,
@@ -11136,11 +11601,6 @@ impl Renderer {
                 .take()
                 .and_then(|request| self.take_readback(request, &mut encoder, shown_texture))
         });
-        self.uploads.finish(&encoder);
-        if has_section_copies {
-            self.section_copy_bytes = 0;
-            self.section_uploads.finish(&encoder);
-        }
         if let Some(image) = surface_frame
             .as_ref()
             .map(|f| &f.texture)
@@ -11178,6 +11638,22 @@ impl Renderer {
                 let size = [self.config.width, self.config.height];
                 Some(copy_frame(&self.device, &mut encoder, &texture, size))
             });
+        if let Some(backstop) = backstop {
+            let (memory, validation) = backstop.errors();
+            if frame_targets::frame_lost(memory, validation) {
+                return self.abandon_frame(frame_targets::Abandoned {
+                    encoder: None,
+                    copies,
+                    surface: surface_frame,
+                    generated: fg_frames,
+                    screenshot: readback.map(|(request, _)| request),
+                    backstop: None,
+                });
+            }
+        }
+        // After everything the frame makes and its scopes' verdict: a frame given up drops its
+        // encoder, and the belt's chunks would not come back from it.
+        self.uploads.finish(&encoder);
         let first_frame = self.first_frame == FirstFrame::Submit;
         // Finished, submitted and presented on the submit thread when nothing after the
         // submission needs this one: screenshots' readbacks, the error scopes (one per
@@ -11185,6 +11661,13 @@ impl Renderer {
         // Frame generation presents its own frames (`frame_gen.present` below).
         // A `screenshot-sequence` frame is submitted here, so it can wait for it to
         // finish.
+        // Background screenshots read back on an earlier frame are collected on every frame:
+        // below, a frame without a readback of its own goes to the submit thread and returns
+        // before the collection after the submission, so a finished screenshot waited for the
+        // next screenshot's frame (#19213).
+        if self.screenshot_result.is_none() {
+            self.screenshot_result = self.screenshot_readbacks.poll();
+        }
         let (encoder, surface_frame, after) = if readback.is_none()
             && frame.pack.frame_timing.is_none()
             && fg_frames.is_none()
@@ -11218,9 +11701,15 @@ impl Renderer {
                 surface: surface_frame,
                 after,
             };
-            match self.queue.submit_later(job) {
+            // The section copies are submitted ahead of the frame on the submit thread.
+            match self
+                .queue
+                .submit_frame(job, copies.take(), Some(&self.device))
+            {
                 Ok(()) => {
                     self.deferred = Some(offscreen);
+                    self.handed_off = true;
+                    self.handed_patches.clone_from(&frame.hud.patches);
                     // The frame's waits for the previous one on the submit thread.
                     self.last_wait += self.queue.take_waited();
                     self.last_encode = started.elapsed().saturating_sub(self.last_wait);
@@ -11229,17 +11718,44 @@ impl Renderer {
                     self.shadow_visible = shadow_visible;
                     return Ok(true);
                 }
-                Err(back) => (back.encoder, back.surface, back.after),
+                Err((back, first)) => {
+                    copies = first;
+                    (back.encoder, back.surface, back.after)
+                }
             }
         } else {
             (encoder, surface_frame, None)
         };
+        // Finishing the commands can run out of memory too (#13624); a screenshot's frame has
+        // its own scopes (`checks`) still open.
+        let finishing = checks.is_none().then(|| GpuChecks::push(&self.device));
         let commands = crate::spans::time("encode", || encoder.finish());
+        if let Some(finishing) = finishing {
+            let (memory, validation) = finishing.errors();
+            if frame_targets::frame_lost(memory, validation) {
+                // The belt's chunks closed on the dropped commands are freed, not recalled.
+                // Readbacks taken for the submit thread start all the same, as there: one
+                // never started would hold its slot for good.
+                if let Some(read) = after {
+                    read();
+                }
+                return self.abandon_frame(frame_targets::Abandoned {
+                    encoder: None,
+                    copies,
+                    surface: surface_frame,
+                    generated: fg_frames,
+                    screenshot: readback.map(|(request, _)| request),
+                    backstop: None,
+                });
+            }
+        }
         if first_frame {
             startup_step(format_args!("submitting the first frame"));
             self.first_frame = FirstFrame::Drawn;
         }
-        let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+        let submission = crate::spans::time("submit", || {
+            self.queue.submit(copies.into_iter().chain([commands]))
+        });
         if let Some(read) = after.or_else(|| self.after_submit()) {
             read();
         }
@@ -11255,6 +11771,9 @@ impl Renderer {
             && let Some(read) = post.submitted()
         {
             read();
+        }
+        if checks.is_none() {
+            self.given_up = 0;
         }
         let failed = checks.and_then(GpuChecks::pop);
         if let Some((request, buffer)) = readback {
@@ -11376,7 +11895,7 @@ impl Renderer {
                 timestamp_writes: timing.as_mut().and_then(|t| t.writes("Hand")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: self.depth.as_ref().expect(WINDOW_DEPTH),
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
                         store: hand_depth_store(layered),
@@ -11448,7 +11967,7 @@ impl Renderer {
             // window's size (100% scale); a smaller one doesn't fit the frame.
             let window = [self.config.width, self.config.height];
             let depth = if overlay.world_depth {
-                Some(&self.depth)
+                Some(self.depth.as_ref().expect(WINDOW_DEPTH))
             } else {
                 (self.world_post.depth_at(window)).filter(|_| overlay.msaa_depth)
             };
@@ -11534,7 +12053,7 @@ impl Renderer {
                 timestamp_writes: timing.as_mut().and_then(|t| t.writes("Crosshair")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: self.depth.as_ref().expect(WINDOW_DEPTH),
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Discard,
@@ -11555,15 +12074,30 @@ impl Renderer {
             let first = overlay.first_crosshair;
             pass.draw(0..4, first..first + overlay.crosshair);
         }
-        let menu_blur = frame
+        let wants_blur = frame
             .menu_blur
             .filter(|_| self.config.usage.contains(wgpu::TextureUsages::COPY_SRC));
+        // Without the room for its targets (#13624) the menu draws over the frame unblurred;
+        // the next screen that blurs tries again.
+        let mut menu_blur = wants_blur;
+        if menu_blur.is_some() {
+            let format = self.output.frame.overlay_format;
+            let device = &self.device;
+            let software = is_software(self.info.device_type);
+            let size = [self.config.width, self.config.height];
+            let blur = self
+                .menu_blur
+                .get_or_insert_with(|| crate::menu_blur::MenuBlur::new(device, format, software));
+            if !blur.ready(device, size) {
+                menu_blur = None;
+            }
+        }
         let blur_at = menu_blur.map_or(0, |_| frame.hud.blur_at);
         self.hud.draw_range(
             encoder,
             hud_target,
             coverage.as_ref(),
-            &self.depth,
+            self.depth.as_ref().expect(WINDOW_DEPTH),
             frame.hud,
             [self.config.width, self.config.height],
             0..blur_at,
@@ -11608,14 +12142,16 @@ impl Renderer {
             if let Some(view) = &coverage {
                 hud_coverage::clear(encoder, view);
             }
-        } else if let Some(blur) = &mut self.menu_blur {
+        } else if wants_blur.is_none()
+            && let Some(blur) = &mut self.menu_blur
+        {
             blur.release();
         }
         self.hud.draw_range(
             encoder,
             hud_target,
             coverage.as_ref(),
-            &self.depth,
+            self.depth.as_ref().expect(WINDOW_DEPTH),
             frame.hud,
             [self.config.width, self.config.height],
             blur_at..frame.hud.vertices.len() as u32,
@@ -11627,10 +12163,16 @@ impl Renderer {
         readback
     }
 }
+/// Window frames are drawn only once their depth is made (`remake_depth`).
+const WINDOW_DEPTH: &str = "the window's depth is made before its frames";
+/// Window frames given up in a row for want of video memory before the game ends (#13624):
+/// about two seconds.
+const GIVEN_UP_LIMIT: u32 = 120;
 /// Out-of-memory and validation error scopes, popped together: the first error either caught.
 struct GpuChecks {
-    memory: wgpu::ErrorScopeGuard,
+    // Dropped (popped) in this order, the reverse of `push`'s: wgpu panics on any other.
     validation: wgpu::ErrorScopeGuard,
+    memory: wgpu::ErrorScopeGuard,
 }
 impl GpuChecks {
     fn push(device: &wgpu::Device) -> Self {
@@ -11639,9 +12181,14 @@ impl GpuChecks {
         Self { memory, validation }
     }
     fn pop(self) -> Option<wgpu::Error> {
+        let (memory, validation) = self.errors();
+        memory.or(validation)
+    }
+    /// The out-of-memory scope's error and the validation scope's.
+    fn errors(self) -> (Option<wgpu::Error>, Option<wgpu::Error>) {
         let validation = pollster::block_on(self.validation.pop());
         let memory = pollster::block_on(self.memory.pop());
-        memory.or(validation)
+        (memory, validation)
     }
 }
 /// How many times the window's size a scaled screenshot is: the Resolution Scale
@@ -12700,8 +13247,9 @@ mod tests {
                 // The shared maths: it needs the file it is appended to. GPU culling's
                 // occlusion test is appended to gpu_culling.wgsl, on Vulkan alone.
                 continue;
-            } else if name == "rt_unpack.wgsl" {
-                // Appended to terrain.wgsl (`rt::scene`'s `Unpacker`), on ray tracing devices.
+            } else if name == "rt_unpack.wgsl" || name == "terrain_mesh.wgsl" {
+                // Appended to terrain.wgsl (`rt::scene`'s `Unpacker` and `mesh_shader`), on
+                // ray tracing or mesh-shader devices.
                 continue;
             } else if name == "terrain.wgsl"
                 || name == "entity.wgsl"
