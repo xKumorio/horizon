@@ -7,5 +7,5 @@
 # `#[horizon_mod_api_macros::replaceable]` on it in the lower crate (an issue is enough); that keeps its point.
 #
 # One line per point: name | #PR | short reason. Lines starting with # are comments.
-mob_render_listened | #19070 | returns per-hook MobRenderHooks mask instead of single bool
-mod_render_pre | #19070 | takes per-hook MobRenderHooks mask instead of single bool
+mob_render_listened | #19580 | returns per-hook MobRenderHooks mask instead of single bool
+mod_render_pre | #19580 | takes per-hook MobRenderHooks mask instead of single bool

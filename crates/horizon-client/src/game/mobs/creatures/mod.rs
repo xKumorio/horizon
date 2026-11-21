@@ -8172,9 +8172,7 @@ impl Game<'_> {
                 }
                 self.mod_layer_geometry(mob, who, parts, added, alpha as f32, camera, packed, out);
             }
-            if hooks.any_post_for(is_player) {
-                self.mod_render_post(mob, who, parts, alpha as f32, camera, packed, out);
-            }
+            self.mod_render_post(mob, who, parts, alpha as f32, camera, packed, out);
             if let Some(rgb) = outline {
                 self.mark_outline(&out[entity_start..], rgb);
                 if let Some(((first, _, _), _)) = skinned {

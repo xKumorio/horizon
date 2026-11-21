@@ -422,5 +422,13 @@ mod tests {
         assert!(living_post_only.any_post());
         assert!(living_post_only.any_post_for(false));
         assert!(living_post_only.any_post_for(true));
+
+        // Verify thread-local FRAME state when only pre hooks are listened:
+        // callers still enter `mod_render_post`, whose own `!hooks.any_post()` guard skips work.
+        FRAME.with_borrow_mut(|frame| frame.listened = pre_only);
+        let stored = FRAME.with_borrow(|frame| frame.listened);
+        assert!(stored.any_pre());
+        assert!(!stored.any_post());
+        FRAME.with_borrow_mut(|frame| frame.listened = MobRenderHooks::default());
     }
 }

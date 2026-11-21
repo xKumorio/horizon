@@ -894,9 +894,7 @@ impl Game<'_> {
             );
         }
         // The post hooks, whether or not the layers drew (a spectator draws none).
-        if hooks.any_post() {
-            self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
-        }
+        self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
         // LivingEntity.isCurrentlyGlowing: the Glowing effect.
         let vanilla = self
             .potions
