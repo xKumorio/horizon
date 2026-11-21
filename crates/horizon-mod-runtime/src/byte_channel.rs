@@ -869,26 +869,54 @@ mod tests {
         });
     }
 
+    fn wait_for_ready_waiters<T>(tx: &Sender<T>, expected: usize, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while tx.0.lock().ready_waiters != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for ready_waiters == {expected} (got {})",
+                tx.0.lock().ready_waiters
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn waiter_counts_wake_blocked_producers_and_consumers() {
         let charge = message_overhead::<u32>() + 4;
         let (tx, rx) = channel::<u32>(charge).unwrap();
         let timeout = Duration::from_secs(5);
 
-        // Consumer blocked in `recv`, `recv_owned`, and `recv_timeout` must wake when `Permit::publish` runs.
-        std::thread::scope(|scope| {
-            let h1 = scope.spawn(|| rx.recv().unwrap());
-            std::thread::sleep(Duration::from_millis(20));
-            assert_eq!(tx.0.lock().ready_waiters, 1);
+        // Move `tx` into `scope` so any panic or timed-out `recv_timeout` drops `tx` before
+        // `scope` joins, guaranteeing blocked consumers never hang the test on failure.
+        let tx = std::thread::scope(|scope| {
+            let tx = tx;
+            let rx_ref = &rx;
+
+            // Consumer blocked in `recv`, `recv_owned`, and `recv_timeout` must wake when published.
+            let (done1_tx, done1_rx) = std::sync::mpsc::channel();
+            let h1 = scope.spawn(move || {
+                let _ = done1_tx.send(rx_ref.recv());
+            });
+            wait_for_ready_waiters(&tx, 1, timeout);
             let p1 = tx.reserve(4).unwrap();
             p1.publish(11).unwrap();
-            assert_eq!(h1.join().unwrap(), 11);
+            assert_eq!(done1_rx.recv_timeout(timeout), Ok(Ok(11)));
+            h1.join().unwrap();
 
-            let h2 = scope.spawn(|| rx.recv_owned().unwrap());
-            std::thread::sleep(Duration::from_millis(20));
+            let (done2_tx, done2_rx) = std::sync::mpsc::channel();
+            let h2 = scope.spawn(move || {
+                let _ = done2_tx.send(rx_ref.recv_owned());
+            });
+            wait_for_ready_waiters(&tx, 1, timeout);
             let p2 = tx.reserve(4).unwrap();
             p2.publish(22).unwrap();
-            let (v2, lease2) = h2.join().unwrap().into_parts();
+            let owned2 = done2_rx
+                .recv_timeout(timeout)
+                .expect("recv_owned wakeup timed out")
+                .expect("recv_owned failed");
+            let (v2, lease2) = owned2.into_parts();
+            h2.join().unwrap();
             assert_eq!(v2, 22);
 
             // Producer blocked in `reserve_waiting` wakes when `ReceiveLease` drops, and
@@ -899,11 +927,14 @@ mod tests {
             assert_eq!(prod.recv_timeout(timeout), Ok(Ok(true)));
             assert_eq!(rx.recv_timeout(timeout), Ok(33));
 
-            let h3 = scope.spawn(|| rx.recv_timeout(timeout).unwrap());
-            std::thread::sleep(Duration::from_millis(20));
-            assert_eq!(tx.0.lock().ready_waiters, 1);
+            let (done3_tx, done3_rx) = std::sync::mpsc::channel();
+            let h3 = scope.spawn(move || {
+                let _ = done3_tx.send(rx_ref.recv_timeout(timeout));
+            });
+            wait_for_ready_waiters(&tx, 1, timeout);
             tx.try_send(34, 4).unwrap();
-            assert_eq!(h3.join().unwrap(), 34);
+            assert_eq!(done3_rx.recv_timeout(timeout), Ok(Ok(34)));
+            h3.join().unwrap();
 
             let ctrl1 = tx.reserve_over_budget(4).unwrap();
             let ctrl2 = control(&tx, 4, 44);
@@ -911,6 +942,7 @@ mod tests {
             drop(ctrl1);
             assert_eq!(ctrl2.recv_timeout(timeout), Ok(Ok(true)));
             assert_eq!(rx.recv_timeout(timeout), Ok(44));
+            tx
         });
         assert_eq!(tx.0.lock().room_waiters, 0);
         assert_eq!(tx.0.lock().ready_waiters, 0);
