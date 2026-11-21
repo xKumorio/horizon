@@ -1309,35 +1309,25 @@ pub fn finish_tick(
     if m.species() == Species::Mannequin {
         m.extra.static_env_stamp = if m.is_static_mannequin() {
             let at = m.position;
-            let below = w.world.block(
-                at.x.floor() as i32,
-                (at.y - 0.2).floor() as i32,
-                at.z.floor() as i32,
-            );
-            let inside = w.world.block(
-                at.x.floor() as i32,
-                at.y.floor() as i32,
-                at.z.floor() as i32,
-            );
-            let inert = !matches!(
-                &*w.facts.get(below).name,
-                "minecraft:turtle_egg"
-                    | "minecraft:magma_block"
-                    | "minecraft:cactus"
-                    | "minecraft:sweet_berry_bush"
-                    | "minecraft:campfire"
-                    | "minecraft:soul_campfire"
-                    | "minecraft:pointed_dripstone"
-                    | "minecraft:wither_rose"
-            ) && !matches!(
-                &*w.facts.get(inside).name,
-                "minecraft:cactus"
-                    | "minecraft:sweet_berry_bush"
-                    | "minecraft:wither_rose"
-                    | "minecraft:fire"
-                    | "minecraft:soul_fire"
-                    | "minecraft:powder_snow"
-            );
+            let [bx, by, bz] = m.block_on_legacy(w);
+            let below = w.world.block(bx, by, bz);
+            let mut inert = is_inert_static_mannequin_below(&w.facts.get(below).name);
+            if inert {
+                let body = m.bounds_at(at).deflate(Vec3::new(1.0e-5, 1.0e-5, 1.0e-5));
+                let lo = body.min_position();
+                let hi = body.max_position();
+                'body_scan: for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
+                    for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
+                        for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
+                            let state = w.world.block(x, y, z);
+                            if !is_inert_static_mannequin_inside(&w.facts.get(state).name) {
+                                inert = false;
+                                break 'body_scan;
+                            }
+                        }
+                    }
+                }
+            }
             inert.then_some((
                 w.world.revision,
                 [at.x.to_bits(), at.y.to_bits(), at.z.to_bits()],
@@ -1349,6 +1339,40 @@ pub fn finish_tick(
     // TraderLlama.maybeDespawn discards the llama in its aiStep: it leaves the
     // level's entity list in this tick, after the rest of its tick ran.
     !(m.removed && m.species() == Species::TraderLlama)
+}
+
+/// Returns `true` when the supporting block under a static mannequin is a vanilla block with no
+/// `step_on` hazard or mod callback that requires running the full tick.
+fn is_inert_static_mannequin_below(name: &str) -> bool {
+    name.starts_with("minecraft:")
+        && !matches!(
+            name,
+            "minecraft:turtle_egg"
+                | "minecraft:magma_block"
+                | "minecraft:cactus"
+                | "minecraft:sweet_berry_bush"
+                | "minecraft:campfire"
+                | "minecraft:soul_campfire"
+                | "minecraft:pointed_dripstone"
+                | "minecraft:wither_rose"
+        )
+}
+
+/// Returns `true` when a block overlapping a static mannequin's bounding box is a vanilla block
+/// with no `entity_inside` hazard or mod callback that requires running the full tick.
+fn is_inert_static_mannequin_inside(name: &str) -> bool {
+    name.starts_with("minecraft:")
+        && !matches!(
+            name,
+            "minecraft:cactus"
+                | "minecraft:sweet_berry_bush"
+                | "minecraft:wither_rose"
+                | "minecraft:fire"
+                | "minecraft:soul_fire"
+                | "minecraft:powder_snow"
+                | "minecraft:cobweb"
+                | "minecraft:honey_block"
+        )
 }
 
 /// Lightweight tick for an immovable, invulnerable mannequin verified stationary in an inert
@@ -8066,5 +8090,15 @@ mod walk_target_tests {
             .push(crate::mobs::StoredEffect::new("minecraft:speed", 20, 0));
         assert!(!m.is_static_mannequin());
         assert!(!tick_static_mannequin(&mut m, 42, -64));
+    }
+
+    #[test]
+    fn static_mannequin_rejects_non_minecraft_and_hazard_blocks() {
+        assert!(is_inert_static_mannequin_below("minecraft:stone"));
+        assert!(is_inert_static_mannequin_inside("minecraft:air"));
+        assert!(!is_inert_static_mannequin_below("mymod:magic_pad"));
+        assert!(!is_inert_static_mannequin_inside("mymod:magic_pad"));
+        assert!(!is_inert_static_mannequin_below("minecraft:magma_block"));
+        assert!(!is_inert_static_mannequin_inside("minecraft:powder_snow"));
     }
 }
