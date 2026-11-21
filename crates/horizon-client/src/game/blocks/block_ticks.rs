@@ -26,18 +26,6 @@ impl Game<'_> {
         self.sync_tick_chunks();
         self.start_ticking_chunks();
         laps.lap("tb_tickets");
-        let random_ticks_on = !self.world_debug
-            && self
-                .ui
-                .rules
-                .int_at(horizon_client::gamerules::vanilla::RANDOM_TICK_SPEED)
-                > 0;
-        if random_ticks_on {
-            self.random_tick_chunks(&mut scratch.ticking);
-        } else {
-            scratch.ticking.clear();
-        }
-        laps.lap("tb_chunks");
         // Entity.checkInsideBlocks for the plates, tripwires, detector rails and
         // buttons under the players (the host and the LAN guests), the minecarts
         // and the arrows (the mobs and other entities are added in `with_level`
@@ -297,6 +285,21 @@ impl Game<'_> {
             }
         }
         horizon_threads::work::clear_work();
+        // Read `RANDOM_TICK_SPEED` after scheduled ticks so any callback fired during
+        // `tick_scheduled()` (e.g. a sniffer egg hatch listener) that raises it from 0
+        // still takes effect on this tick.
+        let random_ticks_on = !debug
+            && self
+                .ui
+                .rules
+                .int_at(horizon_client::gamerules::vanilla::RANDOM_TICK_SPEED)
+                > 0;
+        if random_ticks_on {
+            self.random_tick_chunks(&mut scratch.ticking);
+        } else {
+            scratch.ticking.clear();
+        }
+        laps.lap("tb_chunks");
         if random_ticks_on && !scratch.ticking.is_empty() {
             self.with_level(|b, level, ticks| {
                 // The masks the random ticks will read, built on helper threads first while the
