@@ -1647,10 +1647,11 @@ fn configure(
 }
 
 /// A server brand this client negotiates Horizon's protocol with. Velocity
-/// appends ` (Velocity)` to the brand the server sent, so an exact `horizon`
-/// would leave a proxied Horizon server looking like vanilla.
+/// appends ` (Velocity)` to the brand the server sent, so we accept both
+/// `"horizon"` and `"horizon (Velocity)"` explicitly without matching
+/// arbitrary `"horizon (...)"` prefixes.
 fn horizon_server_brand(brand: &str) -> bool {
-    brand == "horizon" || brand.starts_with("horizon (")
+    matches!(brand, "horizon" | "horizon (Velocity)")
 }
 
 /// A failed `horizon:payloads` negotiation. In the first configuration it names the server's
@@ -2158,6 +2159,8 @@ mod tests {
         for (server_brand, expected_mods) in [
             ("vanilla", false),
             ("vanilla (Velocity)", false),
+            ("horizon (custom)", false),
+            ("horizon (Proxy)", false),
             ("horizon", true),
             ("horizon (Velocity)", true),
         ] {
@@ -2379,6 +2382,8 @@ mod tests {
     fn a_velocity_suffix_is_still_a_horizon_server() {
         assert!(horizon_server_brand("horizon"));
         assert!(horizon_server_brand("horizon (Velocity)"));
+        assert!(!horizon_server_brand("horizon (custom)"));
+        assert!(!horizon_server_brand("horizon (Proxy)"));
         assert!(!horizon_server_brand("vanilla"));
         assert!(!horizon_server_brand("horizonx"));
         assert!(!horizon_server_brand("horizon("));
