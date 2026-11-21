@@ -614,7 +614,7 @@ impl World {
     /// Awake subset of [`Self::block_entity_tickers`], cached until tickers or sleep set changes.
     pub fn awake_block_entity_tickers(
         &mut self,
-    ) -> std::sync::Arc<Vec<(crate::block_entities::Pos, u32)>> {
+    ) -> std::sync::Arc<Vec<(crate::block_entities::Pos, u32, u64)>> {
         let (chunks, air) = (&self.chunks, self.air);
         self.block_entities.awake_tickers(|(x, y, z)| {
             chunks

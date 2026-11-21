@@ -351,21 +351,21 @@ impl Game<'_> {
         let mut last_chunk = (i32::MIN, i32::MIN);
         let mut last_chunk_ticking = false;
         let mut idx = 0usize;
-        let mut last_slot: Option<u32> = None;
+        let mut last_order: Option<u64> = None;
         loop {
-            if let Some(prev) = last_slot
+            if let Some(prev) = last_order
                 && this.world.block_entities.wake_epoch() != wake_epoch
             {
                 tickers = this.world.block_entities.awake_ticker_slots();
                 wake_epoch = this.world.block_entities.wake_epoch();
-                idx = tickers.partition_point(|&(_, slot)| slot <= prev);
+                idx = tickers.partition_point(|&(_, _, order)| order <= prev);
             }
-            let Some(&ticker) = tickers.get(idx) else {
+            let Some(&(pos, ticker_slot, order)) = tickers.get(idx) else {
                 break;
             };
             idx += 1;
-            last_slot = Some(ticker.1);
-            let pos = ticker.0;
+            last_order = Some(order);
+            let ticker = (pos, ticker_slot);
             let chunk = (pos.0 >> 4, pos.2 >> 4);
             let chunk_ticking = if chunk == last_chunk {
                 last_chunk_ticking
