@@ -465,20 +465,44 @@ impl Game<'_> {
             }
         }
     }
-    /// Rebuild sections dirtied by individual block edits since `update_world` and upload them
-    /// before the current frame renders, matching vanilla's synchronous player-edit remesh
-    /// (`SectionRenderDispatcher.rebuildSectionSync`).
+    /// Run `f` inside a local player block-edit scope so writes record `World::immediate_sections`.
+    pub(in crate::game) fn with_player_block_edit<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.world.begin_player_edit();
+        let out = f(self);
+        self.world.end_player_edit();
+        out
+    }
+
+    /// Rebuild sections dirtied by player block edits (or nearby dirty sections when
+    /// `prioritizeChunkUpdates == 2`) and upload them before the current frame renders, matching
+    /// vanilla's `SectionRenderDispatcher.rebuildSectionSync`. Under Threaded (`0`, default),
+    /// no main-thread meshing occurs.
     pub(in crate::game) fn flush_immediate_meshes(&mut self) {
-        if self.title.is_some()
-            || self.world.immediate_sections.is_empty()
-            || self.renderer.is_none()
-        {
+        let mode = self.settings.prioritize_chunk_updates;
+        if mode == 0 || self.title.is_some() || self.renderer.is_none() {
             self.world.immediate_sections.clear();
+            return;
+        }
+        if mode >= 2
+            && let Some(p) = self.player.as_ref()
+        {
+            let camera_block = [
+                p.position.x.floor() as i32,
+                p.position.y.floor() as i32,
+                p.position.z.floor() as i32,
+            ];
+            self.world.mark_nearby_dirty_immediate(
+                camera_block,
+                horizon_client::streaming::immediate_mesh::NEARBY_IMMEDIATE_DIST_SQ,
+                horizon_client::streaming::immediate_mesh::IMMEDIATE_MESH_LIMIT,
+            );
+        }
+        if self.world.immediate_sections.is_empty() {
             return;
         }
         self.observe_light_edits();
         self.ask_edited_light_emission();
-        let uploads = self.streaming.mesh_immediate(&mut self.world);
+        let uploads = self.streaming.mesh_immediate(&mut self.world, mode);
         if uploads.is_empty() {
             return;
         }

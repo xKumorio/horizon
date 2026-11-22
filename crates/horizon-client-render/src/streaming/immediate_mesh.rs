@@ -19,9 +19,13 @@ use crate::{
 /// pool via `World::dirty_sections` so they never stall a frame.
 pub const IMMEDIATE_MESH_LIMIT: usize = 8;
 
+/// Vanilla `SectionRenderDispatcher` squared distance threshold for `PrioritizeChunkUpdates.NEARBY`.
+pub const NEARBY_IMMEDIATE_DIST_SQ: f64 = 768.0;
+
 /// Take ready columns from `immediate` within `IMMEDIATE_MESH_LIMIT`, removing accepted sections
-/// from `dirty`.
+/// from `dirty`. Returns empty when `prioritize_chunk_updates == 0` (Threaded, vanilla default).
 fn take_ready_immediate_sections(
+    prioritize_chunk_updates: u8,
     immediate: &mut DirtySections,
     dirty: &mut DirtySections,
     lit: &FxHashSet<(i32, i32)>,
@@ -30,7 +34,7 @@ fn take_ready_immediate_sections(
     has_chunk: impl Fn(i32, i32) -> bool,
 ) -> Vec<((i32, i32), SectionMask)> {
     let total = immediate.len();
-    if total == 0 || total > IMMEDIATE_MESH_LIMIT {
+    if prioritize_chunk_updates == 0 || total == 0 || total > IMMEDIATE_MESH_LIMIT {
         immediate.clear();
         return Vec::new();
     }
@@ -66,9 +70,14 @@ fn take_ready_immediate_sections(
 
 impl Streaming {
     /// Synchronously rebuild sections dirtied by individual block edits since `update_world`,
-    /// returning meshes ready for immediate GPU upload before the current frame draws.
-    pub fn mesh_immediate(&mut self, world: &mut World) -> Vec<((i32, i32, i32), SectionMesh)> {
-        if !self.mesh || world.immediate_sections.is_empty() {
+    /// gated by `prioritize_chunk_updates` (`0` = Threaded/none, `1` = Semi-Blocking/player-edited,
+    /// `2` = Fully Blocking/nearby), returning meshes ready for immediate GPU upload.
+    pub fn mesh_immediate(
+        &mut self,
+        world: &mut World,
+        prioritize_chunk_updates: u8,
+    ) -> Vec<((i32, i32, i32), SectionMesh)> {
+        if prioritize_chunk_updates == 0 || !self.mesh || world.immediate_sections.is_empty() {
             world.immediate_sections.clear();
             return Vec::new();
         }
@@ -89,6 +98,7 @@ impl Streaming {
             let ranges = self.ranges();
             let chunks = &world.chunks;
             take_ready_immediate_sections(
+                prioritize_chunk_updates,
                 &mut world.immediate_sections,
                 &mut world.dirty_sections,
                 &self.lit,
@@ -111,7 +121,6 @@ impl Streaming {
                 }
                 continue;
             };
-            self.meshed.insert((x, z));
             for sy in sections.iter().map(|sy| sy as i32) {
                 // Invalidate any older in-flight worker job for this section so its stale
                 // `Done::Meshed` is discarded when it finishes.
@@ -159,19 +168,79 @@ mod tests {
     }
 
     #[test]
-    fn set_block_marks_immediate_sections_for_edit_and_neighbours() {
+    fn set_block_marks_immediate_sections_only_inside_player_edit_scope() {
         let mut world = World::new(BlockStateId(0), 0);
         world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        // Ordinary writes (server updates, redstone, crops) must NOT mark immediate_sections.
         world.set(8, 64, 8, BlockStateId(1)).unwrap();
         let sy = (64 - world.bottom_y()) >> 4;
+        assert!(world.immediate_sections.is_empty());
+        assert!(world.dirty_sections.contains(&(0, sy, 0)));
+
+        // Player-edit scoped writes mark immediate_sections for the touched section and neighbours.
+        world.dirty_sections.clear();
+        world.begin_player_edit();
+        world.set(8, 64, 8, BlockStateId(2)).unwrap();
+        world.end_player_edit();
         assert!(world.immediate_sections.contains(&(0, sy, 0)));
         assert!(world.dirty_sections.contains(&(0, sy, 0)));
+
         // Corner of a section marks up to 8 sections (within IMMEDIATE_MESH_LIMIT).
         world.immediate_sections.clear();
         world.dirty_sections.clear();
-        world.set(0, 64, 0, BlockStateId(2)).unwrap();
+        world.begin_player_edit();
+        world.set(0, 64, 0, BlockStateId(3)).unwrap();
+        world.end_player_edit();
         assert_eq!(world.immediate_sections.len(), 8);
         assert!(world.immediate_sections.len() <= IMMEDIATE_MESH_LIMIT);
+    }
+
+    #[test]
+    fn threaded_chunk_builder_mode_never_takes_immediate_sections() {
+        let mut immediate = DirtySections::default();
+        let mut dirty = DirtySections::default();
+        let mut lit = FxHashSet::default();
+        let lighting = FxHashMap::default();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                lit.insert((dx, dz));
+            }
+        }
+        immediate.insert((0, 4, 0));
+        dirty.insert((0, 4, 0));
+
+        // prioritizeChunkUpdates == 0 (Threaded, vanilla default): zero main-thread meshing.
+        let ready = take_ready_immediate_sections(
+            0,
+            &mut immediate,
+            &mut dirty,
+            &lit,
+            &lighting,
+            |_, _| true,
+            |_, _| true,
+        );
+        assert!(ready.is_empty());
+        assert!(immediate.is_empty());
+        assert!(dirty.contains(&(0, 4, 0)));
+    }
+
+    #[test]
+    fn nearby_mode_marks_dirty_sections_within_768_sq_blocks_and_skips_far_ones() {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        world.chunks.insert((5, 0), Arc::new(Chunk::empty(5, 0)));
+        world.set(8, 64, 8, BlockStateId(1)).unwrap();
+        world.set(88, 64, 8, BlockStateId(1)).unwrap();
+        assert!(world.immediate_sections.is_empty());
+
+        world.mark_nearby_dirty_immediate(
+            [8, 64, 8],
+            NEARBY_IMMEDIATE_DIST_SQ,
+            IMMEDIATE_MESH_LIMIT,
+        );
+        let sy = (64 - world.bottom_y()) >> 4;
+        assert!(world.immediate_sections.contains(&(0, sy, 0)));
+        assert!(!world.immediate_sections.contains(&(5, sy, 0)));
     }
 
     #[test]
@@ -190,6 +259,7 @@ mod tests {
         dirty.insert((0, 5, 0));
 
         let ready = take_ready_immediate_sections(
+            1,
             &mut immediate,
             &mut dirty,
             &lit,
@@ -222,6 +292,7 @@ mod tests {
         }
 
         let ready = take_ready_immediate_sections(
+            1,
             &mut immediate,
             &mut dirty,
             &lit,
@@ -250,6 +321,7 @@ mod tests {
         dirty.insert((0, 4, 0));
 
         let ready = take_ready_immediate_sections(
+            1,
             &mut immediate,
             &mut dirty,
             &lit,
@@ -277,6 +349,7 @@ mod tests {
         immediate.insert((0, 4, 0));
 
         let ready = take_ready_immediate_sections(
+            1,
             &mut immediate,
             &mut dirty,
             &lit,

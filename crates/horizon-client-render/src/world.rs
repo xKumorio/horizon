@@ -110,6 +110,9 @@ pub struct World {
     /// rebuilt synchronously before the frame draws (`SectionRenderDispatcher.rebuildSectionSync`)
     /// so a placed or broken block appears on the same frame as its selection outline.
     pub immediate_sections: DirtySections,
+    /// Nesting depth of active local player block-edit scopes; only writes made while `> 0`
+    /// are recorded in `immediate_sections`.
+    player_edit_depth: u32,
     /// Chunks whose light must be recomputed.
     pub dirty_light: crate::fast_hash::FxHashSet<(i32, i32)>,
     /// Edits on lit chunks (position, old state, new state), relit
@@ -340,6 +343,7 @@ impl World {
             fast_lava: false,
             dirty_sections: Default::default(),
             immediate_sections: Default::default(),
+            player_edit_depth: 0,
             dirty_light: Default::default(),
             light_edits: Vec::new(),
             light_checks: Default::default(),
@@ -475,6 +479,47 @@ impl World {
             })
             .unwrap_or(false)
     }
+    /// Enter a local player block-edit scope so writes mark `immediate_sections`.
+    pub fn begin_player_edit(&mut self) {
+        self.player_edit_depth = self.player_edit_depth.saturating_add(1);
+    }
+    /// Leave a local player block-edit scope.
+    pub fn end_player_edit(&mut self) {
+        self.player_edit_depth = self.player_edit_depth.saturating_sub(1);
+    }
+    /// Copy dirty sections whose center is within `max_dist_sq` of `camera_block` into
+    /// `immediate_sections` (vanilla `PrioritizeChunkUpdates.NEARBY`, 768.0 squared blocks),
+    /// stopping once `immediate_sections.len() > limit`.
+    pub fn mark_nearby_dirty_immediate(
+        &mut self,
+        camera_block: [i32; 3],
+        max_dist_sq: f64,
+        limit: usize,
+    ) {
+        let bottom_y = self.bottom_y();
+        let (cx0, cy0, cz0) = (
+            f64::from(camera_block[0]),
+            f64::from(camera_block[1]),
+            f64::from(camera_block[2]),
+        );
+        for ((cx, cz), sections) in self.dirty_sections.columns() {
+            let sx = f64::from(cx * 16 + 8) - cx0;
+            let sz = f64::from(cz * 16 + 8) - cz0;
+            let horiz = sx * sx + sz * sz;
+            if horiz > max_dist_sq {
+                continue;
+            }
+            for sy in sections.iter().map(|s| s as i32) {
+                let sy_d = f64::from(bottom_y + sy * 16 + 8) - cy0;
+                if horiz + sy_d * sy_d <= max_dist_sq {
+                    self.immediate_sections.insert((cx, sy, cz));
+                    if self.immediate_sections.len() > limit {
+                        return;
+                    }
+                }
+            }
+        }
+    }
     /// Resident storage write; marks the touched sections (and neighbours on
     /// section borders) for remeshing and the surrounding chunks for relighting.
     /// Neighbour updates, drops and block entities belong to the gameplay layer.
@@ -527,11 +572,14 @@ impl World {
             // border (the diagonal only where both borders meet).
             let sy = (y - min_y) >> 4;
             let local_y = y & 15;
+            let record_immediate = self.player_edit_depth > 0;
             let mark =
                 |dirty: &mut DirtySections, immediate: &mut DirtySections, bx: i32, bz: i32| {
                     let mut insert = |section: (i32, i32, i32)| {
                         dirty.insert(section);
-                        immediate.insert(section);
+                        if record_immediate {
+                            immediate.insert(section);
+                        }
                     };
                     insert((bx >> 4, sy, bz >> 4));
                     if local_y == 0 && sy > 0 {

@@ -1201,7 +1201,7 @@ mod queue_census;
 pub use queue_census::QueueCensus;
 mod forced_cover;
 mod forced_ring;
-mod immediate_mesh;
+pub mod immediate_mesh;
 mod mesh_job;
 mod relight_now;
 mod viewed_meshing;
