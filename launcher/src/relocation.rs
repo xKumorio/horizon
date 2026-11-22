@@ -39,6 +39,10 @@ fn remap(value: &mut Value, source: &Roots, target: &Roots) {
 pub fn prepare_paths(stage: &Roots, source: &Roots, target: &Roots) -> Result<(), String> {
     for name in ["settings.json", "servers.json", "instances.json"] {
         let path = stage.launcher.join(name);
+        // A copied relative link must not be written through to another staged file.
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            data_location::reject_link(&path, &meta)?;
+        }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -89,6 +93,16 @@ pub fn prepare_paths(stage: &Roots, source: &Roots, target: &Roots) -> Result<()
 
 /// Refuse live games/build tools even if the window that started them has already exited.
 fn ensure_idle(source: &Roots) -> Result<(), String> {
+    // A background service may run the server runtime's program from the launcher's data, and
+    // which one it runs can't be told without running it, so any registered one stops the move.
+    let services = crate::servers::registered_services()
+        .map_err(|e| format!("Couldn't check for background servers: {e}"))?;
+    if !services.is_empty() {
+        return Err(format!(
+            "Turn off running in the background on the Servers page, or run `horizon-server --dir <server folder> service uninstall` (add --system for a system service), before moving data: {}",
+            services.join(", ")
+        ));
+    }
     #[cfg(windows)]
     let output = process::command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"])
@@ -165,7 +179,9 @@ pub fn run_worker() -> Option<i32> {
     let target = args.next().map(PathBuf::from);
     let restart = args.next().is_some_and(|a| a == "--restart");
     let result = (|| {
-        let target = target.ok_or("--relocate-data needs an empty destination folder")?;
+        let target = target
+            .as_deref()
+            .ok_or("--relocate-data needs an empty destination folder")?;
         data_location::validate()?;
         let source = Roots {
             launcher: backend::data_dir(),
@@ -181,7 +197,7 @@ pub fn run_worker() -> Option<i32> {
         );
         let destination = data_location::migrate_current_with_prepare(
             &source,
-            &target,
+            target,
             |message| eprintln!("{message}"),
             |stage, target| {
                 ensure_idle(&source)?;
@@ -194,15 +210,26 @@ pub fn run_worker() -> Option<i32> {
     if let Err(error) = &result {
         eprintln!("Data was not relocated: {error}");
     }
+    // The stages earlier retries set aside, which only the player may delete.
+    let kept = target
+        .as_deref()
+        .and_then(|target| data_location::kept_note(target, None));
+    if let Some(kept) = &kept {
+        eprintln!("{kept}");
+    }
     let code = i32::from(result.is_err());
     if restart {
         let mut command = process::command(backend::exe_path());
         command
             .env_remove("HORIZON_RELOCATION_ERROR")
-            .env_remove("HORIZON_RELOCATION_BACKUP");
+            .env_remove("HORIZON_RELOCATION_BACKUP")
+            .env_remove("HORIZON_RELOCATION_KEPT");
         match &result {
             Ok(backup) => {
                 command.env("HORIZON_RELOCATION_BACKUP", backup);
+                if let Some(kept) = &kept {
+                    command.env("HORIZON_RELOCATION_KEPT", kept);
+                }
             }
             Err(error) => {
                 command.env("HORIZON_RELOCATION_ERROR", error);

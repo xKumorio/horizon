@@ -2,6 +2,7 @@
 //! server threads and the play-state hub, feeds it the world's entities each
 //! tick and turns what the guests do into gameplay. A world that is not open
 //! costs one `Option` check per tick.
+mod control;
 mod event_timings;
 #[cfg(test)]
 mod level_event_targets;
@@ -1135,16 +1136,11 @@ impl Game<'_> {
                 if self.title.is_some() {
                     return Err("open a world first".into());
                 }
-                let port = words.get(2).map_or(Ok(0), |p| p.parse::<u16>())?;
-                self.lan_open(LanSettings {
-                    port: if port == 0 {
-                        lan::available_port()
-                    } else {
-                        port
-                    },
-                    guest_commands: words.contains(&"commands"),
-                    force_game_mode: words.contains(&"force"),
-                })?;
+                let mut settings = control::open_settings(&words[2..])?;
+                if settings.port == 0 {
+                    settings.port = lan::available_port();
+                }
+                self.lan_open(settings)?;
                 Ok(Some(json!({ "ok": true, "port": self.lan_port() })))
             }
             Some("close") => {
@@ -1165,6 +1161,8 @@ impl Game<'_> {
                 // The owner's profile name.
                 "host": self.options.player_name(),
                 "port": h.settings.port,
+                "guest_commands": h.hub.config.guest_commands,
+                "force_game_mode": h.hub.config.force_game_mode,
                 // The server's own world: its finished chunks and how many it
                 // has generated or loaded so far.
                 "world": {
@@ -2320,9 +2318,13 @@ impl Game<'_> {
                         let theirs = super::Dim::from_id(&guest.dimension);
                         if self.enter_level(theirs).is_ok() {
                             let conn = guest.conn;
+                            let (uuid, name) = (guest.uuid, guest.name.clone());
+                            let reason = guest.left_reason.clone();
                             let host = self.lan.as_mut()?;
                             let at = host.hub.guests.len();
                             host.hub.guests.push(*guest);
+                            // Still placed, with their state in: a mod can act on them first.
+                            self.announce_player_leaving(conn, uuid, &name, &reason);
                             self.guest_disconnected(conn);
                             let Some(host) = self.lan.as_mut() else {
                                 unreachable!("LanHost dropped inside a tick; closes are deferred")
@@ -2385,6 +2387,19 @@ impl Game<'_> {
                     }
                 }
                 HostEvent::PlayerMove(conn) => self.lan_player_move(conn),
+                HostEvent::PlayerMovePacket {
+                    conn,
+                    to,
+                    to_rotation,
+                    on_ground,
+                    has_position,
+                    has_rotation,
+                } => self.announce_player_move_packet(
+                    conn,
+                    to,
+                    to_rotation,
+                    (on_ground, has_position, has_rotation),
+                ),
                 HostEvent::Pong { conn, id } => self.announce_player_pong(conn, id),
                 HostEvent::Input { conn, flags } => {
                     if !mod_api::__private::listened(mod_api::HookId::PlayerInput) {
