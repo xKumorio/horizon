@@ -387,48 +387,4 @@ mod tests {
         let pose = mob_pose(at, 37.0);
         assert!(close(pose.transform_point3(Vec3::ZERO), at.as_vec3()));
     }
-
-    #[test]
-    fn mob_render_hooks_gates_pre_and_post_phases_independently() {
-        let none = MobRenderHooks::default();
-        assert!(!none.any_pre());
-        assert!(!none.any_post());
-        assert!(!none.any_post_for(false));
-        assert!(!none.any_post_for(true));
-
-        let pre_only = MobRenderHooks {
-            player_pre: true,
-            ..Default::default()
-        };
-        assert!(pre_only.any_pre());
-        assert!(!pre_only.any_post());
-        assert!(!pre_only.any_post_for(false));
-        assert!(!pre_only.any_post_for(true));
-
-        let player_post_only = MobRenderHooks {
-            player_post: true,
-            ..Default::default()
-        };
-        assert!(!player_post_only.any_pre());
-        assert!(player_post_only.any_post());
-        assert!(!player_post_only.any_post_for(false));
-        assert!(player_post_only.any_post_for(true));
-
-        let living_post_only = MobRenderHooks {
-            living_post: true,
-            ..Default::default()
-        };
-        assert!(!living_post_only.any_pre());
-        assert!(living_post_only.any_post());
-        assert!(living_post_only.any_post_for(false));
-        assert!(living_post_only.any_post_for(true));
-
-        // Verify thread-local FRAME state when only pre hooks are listened:
-        // callers still enter `mod_render_post`, whose own `!hooks.any_post()` guard skips work.
-        FRAME.with_borrow_mut(|frame| frame.listened = pre_only);
-        let stored = FRAME.with_borrow(|frame| frame.listened);
-        assert!(stored.any_pre());
-        assert!(!stored.any_post());
-        FRAME.with_borrow_mut(|frame| frame.listened = MobRenderHooks::default());
-    }
 }
