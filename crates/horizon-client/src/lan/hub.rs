@@ -57,7 +57,9 @@ mod spawn_info;
 pub(super) mod terrain;
 use advancements::AdvancementOwners;
 use chat::yellow_names;
-pub use pending_move::{Accepted, Hearing, PendingMove};
+pub use pending_move::{
+    Accepted, Hearing, MOVE_PACKET_BUDGET, MOVE_PACKET_QUEUE, MovePacket, PendingMove,
+};
 use raw_inbox::{DeferredPayload, PacketDrain, yield_raw};
 pub mod game_event {
     pub const NO_RESPAWN_BLOCK_AVAILABLE: u8 = 0;
@@ -185,6 +187,15 @@ pub enum HostEvent {
     ),
     /// A changed movement report is held for the game to rule on ([`Hub::resolve_move`]).
     PlayerMove(u32),
+    /// A validated movement packet, whether or not it changes anything (`player_move_packet`).
+    PlayerMovePacket {
+        conn: u32,
+        to: [f64; 3],
+        to_rotation: [f32; 2],
+        on_ground: bool,
+        has_position: bool,
+        has_rotation: bool,
+    },
     /// An accepted position started a jump, before later gameplay packets.
     Jump {
         conn: u32,
@@ -354,6 +365,9 @@ pub struct Hub {
     pending_kicks: Vec<HostEvent>,
     /// A native mod listens to `player_move`: a changed report waits for the game ([`pending_move`]).
     pub moves_listened: bool,
+    /// A native mod listens to `player_move_packet`: every validated movement packet is told to
+    /// the game.
+    pub move_packets_listened: bool,
     /// `[transfer]` on (a dedicated server's `--transfers`): the players a proxy
     /// said would arrive (`player-expect`). None while it is off.
     pub transfers: Option<super::arrivals::Transfers>,
@@ -430,6 +444,9 @@ pub struct Hub {
     /// Names a server mod shows for players in the Tab list only (`player_set_list_name`),
     /// by UUID, over their nickname.
     pub list_names: std::collections::HashMap<u128, crate::text::Text>,
+    /// Client-only entities a mod put in one viewer's client (`viewer_entity_spawn`), by
+    /// (viewer UUID, entity id).
+    pub viewer_entities: std::collections::HashSet<(u128, u32)>,
     /// The name the server's user cache knew a joining player by, by UUID, looked up before the
     /// cache learns the new one (PlayerList.placeNewPlayer's `oldName`); taken by the join line.
     pub former_names: std::collections::HashMap<u128, String>,
@@ -863,6 +880,7 @@ impl Hub {
             deferred_payloads: Default::default(),
             pending_kicks: Vec::new(),
             moves_listened: false,
+            move_packets_listened: false,
             transfers: None,
             native_tracking: Vec::new(),
             attachment_snapshots: Vec::new(),
@@ -876,6 +894,7 @@ impl Hub {
             teams: Vec::new(),
             nicknames: std::collections::HashMap::new(),
             list_names: std::collections::HashMap::new(),
+            viewer_entities: std::collections::HashSet::new(),
             former_names: std::collections::HashMap::new(),
             viewed: Default::default(),
         }
@@ -2857,6 +2876,11 @@ impl Hub {
                 }
             }
         }
+        // In solo singleplayer there is only one receiver, so retaining encoded
+        // wire sections and heightmaps across sends only duplicates chunk RAM.
+        // Update before the empty-batch return so a departing guest releases the
+        // multiplayer cache even if the remaining player stands still.
+        self.encoder.set_retain_wire(self.guests.len() > 1);
         if batches.is_empty() {
             return;
         }
@@ -2925,12 +2949,26 @@ impl Hub {
                 (i, taken, far, bodies)
             })
             .collect();
-        self.encoder.warm(&columns.chunks);
-        let mut encoded = self.encoder.bodies_with(&columns.chunks, world, &|x, z| {
-            ctx.streaming.and_then(|s| s.proto_sections(x, z))
-        });
-        let uses = &mut columns.uses;
         let chunks = &columns.chunks;
+        self.encoder.warm(chunks);
+        // A column one batch takes keeps its own buffer. One that several take is
+        // copied into shared storage once, and each batch queues a reference to it.
+        let mut encoded: Vec<super::Body> = self
+            .encoder
+            .bodies_with(chunks, world, &|x, z| {
+                ctx.streaming.and_then(|s| s.proto_sections(x, z))
+            })
+            .into_iter()
+            .zip(&columns.uses)
+            .map(|(body, &uses)| {
+                if uses == 1 {
+                    super::Body::Owned(body)
+                } else {
+                    super::Body::shared(body)
+                }
+            })
+            .collect();
+        self.encoder.clear_batch_wire();
         for (i, taken, far, batch) in batches {
             let g = &self.guests[i];
             let keys = taken
@@ -2951,11 +2989,11 @@ impl Hub {
                             if memory && !protected {
                                 super::handoff::offer(chunks[j]);
                             }
-                            uses[j] -= 1;
-                            if uses[j] == 0 {
-                                super::Body::Owned(std::mem::take(&mut encoded[j]))
-                            } else {
-                                super::Body::Owned(encoded[j].clone())
+                            match &mut encoded[j] {
+                                super::Body::Owned(body) => {
+                                    super::Body::Owned(std::mem::take(body))
+                                }
+                                super::Body::Shared(body) => super::Body::Shared(Arc::clone(body)),
                             }
                         }
                         Body::Saved(body) => super::Body::Shared(body),
@@ -4261,7 +4299,16 @@ impl Hub {
                             }
                         });
                         let rot = (p.yaw, p.pitch);
-                        self.position_change(i, at, rot, 0, Hearing::Confirmation, ctx, events);
+                        self.position_change(
+                            i,
+                            at,
+                            rot,
+                            0,
+                            (true, true),
+                            Hearing::Confirmation,
+                            ctx,
+                            events,
+                        );
                     }
                 }
                 // handlePlayerAbilities: the client flies only if it may.
@@ -4575,6 +4622,7 @@ impl Hub {
         ctx: &TickCtx,
         events: &mut Vec<HostEvent>,
     ) {
+        let shape = (pos.is_some(), rot.is_some());
         let conn = self.guests[i].conn;
         // containsInvalidValues, on the packet's values (0 where it has none).
         let (yaw, pitch) = rot.unwrap_or_default();
@@ -4616,7 +4664,7 @@ impl Hub {
         }
         let to = pos.unwrap_or(g.position);
         let rot = rot.unwrap_or((g.yaw, g.pitch));
-        self.position_change(i, to, rot, flags, Hearing::Heard, ctx, events);
+        self.position_change(i, to, rot, flags, shape, Hearing::Heard, ctx, events);
     }
 
     /// ServerGamePacketListenerImpl.handlePlayerPositionChange.
@@ -4626,6 +4674,7 @@ impl Hub {
         to: [f64; 3],
         (yaw, pitch): (f32, f32),
         flags: u8,
+        (has_position, has_rotation): (bool, bool),
         hearing: Hearing,
         ctx: &TickCtx,
         events: &mut Vec<HostEvent>,
@@ -4707,6 +4756,7 @@ impl Hub {
         }
         // The anticheat's `ground`: a claim of the ground with nothing to
         // stand on is dropped (no-fall, walking on water).
+        let client_on_ground = flags & 1 != 0;
         let (mut flags, mut corrected) = (flags, false);
         if flags & 1 != 0 && self.anticheat.is_some() {
             match self.anticheat_ground(i, to, stands, ctx, events) {
@@ -4751,6 +4801,9 @@ impl Hub {
             flags,
             stands,
             floating,
+            on_ground: client_on_ground,
+            has_position,
+            has_rotation,
         };
         self.accept_move(i, accepted, hearing, events);
     }
@@ -4961,6 +5014,86 @@ impl Hub {
                 ..Default::default()
             }],
         }));
+    }
+
+    /// `viewer_entity_spawn`: an `AddEntity` of `kind` (its registry id, `entity_type`) with entity id
+    /// `id` at `pos`, to `viewer`'s client alone. False when the viewer has no client or `kind` is not
+    /// an entity type. The UUID is the id itself: the entity is not in the level.
+    pub fn spawn_viewer_entity(
+        &mut self,
+        viewer: u128,
+        id: u32,
+        kind: &str,
+        pos: [f64; 3],
+    ) -> bool {
+        let Some(index) = self
+            .guests
+            .iter()
+            .position(|g| g.uuid == viewer && g.participates_online())
+        else {
+            return false;
+        };
+        let (types, sync) = (&mut self.entity_types, &self.sync);
+        let Some(kind_id) = entity_type(types, sync, kind) else {
+            return false;
+        };
+        self.guests[index].send(&C::AddEntity(play::AddEntity {
+            id: id as i32,
+            uuid: u128::from(id),
+            kind: kind_id,
+            position: pos,
+            velocity: [0.0; 3],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        }));
+        self.viewer_entities.insert((viewer, id));
+        true
+    }
+
+    /// `viewer_entity_move`: a `TeleportEntity` of the client-only entity `id` to `pos`, to `viewer`'s
+    /// client alone. False when the viewer has no such entity or no client.
+    pub fn move_viewer_entity(&mut self, viewer: u128, id: u32, pos: [f64; 3]) -> bool {
+        if !self.viewer_entities.contains(&(viewer, id)) {
+            return false;
+        }
+        let Some(index) = self
+            .guests
+            .iter()
+            .position(|g| g.uuid == viewer && g.participates_online())
+        else {
+            return false;
+        };
+        self.guests[index].send(&C::TeleportEntity(play::TeleportEntity {
+            id: id as i32,
+            position: pos,
+            delta: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            relatives: 0,
+            on_ground: false,
+        }));
+        true
+    }
+
+    /// `viewer_entity_remove`: a `RemoveEntities` of the client-only entity `id`, to `viewer`'s client
+    /// alone. False when the viewer has no such entity or no client.
+    pub fn remove_viewer_entity(&mut self, viewer: u128, id: u32) -> bool {
+        if !self.viewer_entities.remove(&(viewer, id)) {
+            return false;
+        }
+        let Some(index) = self
+            .guests
+            .iter()
+            .position(|g| g.uuid == viewer && g.participates_online())
+        else {
+            return false;
+        };
+        self.guests[index].send(&C::RemoveEntities(play::RemoveEntities {
+            ids: vec![id as i32],
+        }));
+        true
     }
 
     /// Paper's `Player.setPlayerListName`: `name` in place of the player's name in the Tab
@@ -8754,5 +8887,114 @@ mod tests {
         hub.guests.update(0, |g| g.release_tickets());
         hub.guests.update(0, |g| g.watching = false);
         assert_eq!(hub.guests[0].ticket_chunk(), left);
+    }
+
+    /// A client-only entity reaches only its viewer: spawn, move and remove are one packet each to that
+    /// client, and a move or removal of an id the viewer does not hold is refused. Uuid 1 is Bob,
+    /// uuid 2 is Alice.
+    #[test]
+    fn a_viewer_entity_reaches_that_viewer_only() {
+        let (mut hub, bob) = hub_with_a_guest();
+        hub.entity_types.insert("minecraft:shulker".into(), 1);
+        let alice = add_alice(&mut hub);
+        sent(&alice);
+        sent(&bob);
+        assert!(hub.spawn_viewer_entity(2, 9001, "minecraft:shulker", [1.0, 2.0, 3.0]));
+        let got = sent(&alice);
+        assert!(
+            matches!(&got[0], play::Clientbound::AddEntity(e) if e.id == 9001 && e.position == [1.0, 2.0, 3.0])
+        );
+        assert_eq!(got.len(), 1);
+        assert!(sent(&bob).is_empty(), "the other players are not told");
+        assert!(hub.move_viewer_entity(2, 9001, [4.0, 5.0, 6.0]));
+        assert!(
+            matches!(&sent(&alice)[0], play::Clientbound::TeleportEntity(t) if t.id == 9001 && t.position == [4.0, 5.0, 6.0])
+        );
+        assert!(hub.remove_viewer_entity(2, 9001));
+        assert!(
+            matches!(&sent(&alice)[0], play::Clientbound::RemoveEntities(r) if r.ids == [9001])
+        );
+        // Gone for good: a second removal or move is refused, and nothing is sent.
+        assert!(!hub.remove_viewer_entity(2, 9001));
+        assert!(!hub.move_viewer_entity(2, 9001, [0.0; 3]));
+        // Not for a player who is not on, and not for an unknown kind.
+        assert!(!hub.spawn_viewer_entity(7, 9002, "minecraft:shulker", [0.0; 3]));
+        assert!(!hub.spawn_viewer_entity(2, 9003, "minecraft:no_such_entity", [0.0; 3]));
+    }
+
+    #[test]
+    fn departing_guest_releases_multiplayer_wire_cache_when_batches_are_empty() {
+        let (mut hub, _rx1) = hub_with_a_guest();
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut alice = Guest::new(
+            crate::lan::Joined {
+                conn: 2,
+                uuid: 2,
+                name: "Alice".into(),
+                properties: Vec::new(),
+                info: horizon_protocol::packets::configuration::ClientInformation::new(8),
+                brand: "vanilla".into(),
+                sender: crate::lan::PlayerSender::new(tx2, std::sync::Arc::default()),
+                latency: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 64.0, 0.5],
+            8,
+        );
+        alice.placed = true;
+        alice.dimension = "minecraft:overworld".into();
+        hub.guests.push(alice);
+        hub.encoder = ChunkEncoder::new(
+            ["minecraft:air", "minecraft:stone"].map(|n| (std::sync::Arc::<str>::from(n), false)),
+            &horizon_protocol::registry::Builtin::default(),
+            &[],
+            &[],
+        );
+        hub.encoder.tables = Some(std::sync::Arc::new(
+            crate::save::SaveTables::for_heightmaps(crate::assets::Properties::for_tests(&[
+                (true, false, false, false),
+                (false, false, true, true),
+            ])),
+        ));
+        let mut world = floor_at(1);
+        let mut next_entity = 100;
+        let border = crate::worldborder::WorldBorder::default();
+        let ctx = TickCtx {
+            sea_level: 63,
+            world: &mut world,
+            entities: &[],
+            next_entity: &mut next_entity,
+            spawn: [0.5, 64.0, 0.5],
+            spawn_angle: [0.0; 2],
+            spawn_dimension: "minecraft:overworld",
+            difficulty: 2,
+            difficulty_locked: false,
+            clock_rate: 1.0,
+            tick_rate: 20.0,
+            tick_frozen: false,
+            tick_steps: Default::default(),
+            collision: None,
+            border: &border,
+            streaming: None,
+        };
+        for _ in 0..3 {
+            hub.ticks += 10;
+            for i in 0..hub.guests.len() {
+                hub.guests.update(i, |g| g.unacknowledged = 0);
+            }
+            hub.update_chunks(&ctx);
+        }
+        let [(_, sections_multiplayer), (heights_multiplayer, _)] = hub.encoder.cache_census();
+        assert!(heights_multiplayer > 0);
+        // The second guest leaves while the remaining player has no pending batches.
+        let _ = hub.remove_guest(1, "bye");
+        hub.ticks += 10;
+        hub.guests.update(0, |g| g.unacknowledged = 0);
+        hub.update_chunks(&ctx);
+        let [(_, sections_solo), (heights_solo, _)] = hub.encoder.cache_census();
+        assert_eq!(heights_solo, 0);
+        assert!(sections_solo < sections_multiplayer);
     }
 }
