@@ -196,7 +196,12 @@ impl Stats {
                 self.events.push((ty.to_owned(), key.to_owned(), None));
                 return;
             }
-            if let Some(m) = self.values.get_mut(ty) {
+            if ty == "minecraft:custom" && self.tick_present != 0 {
+                self.values
+                    .entry(ty.to_owned())
+                    .or_default()
+                    .insert(key.to_owned(), 0);
+            } else if let Some(m) = self.values.get_mut(ty) {
                 m.insert(key.to_owned(), 0);
             }
             self.mark_dirty(ty, key);
@@ -701,5 +706,27 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.get("custom", "minecraft:play_time"), 0);
         assert_eq!(s.to_json()["stats"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn reset_custom_non_tick_key_creates_category_when_inline_counters_present() {
+        // With no inline counters and no custom map, reset leaves minecraft:custom absent.
+        let mut empty = Stats::default();
+        empty.reset("custom", "minecraft:jump");
+        assert!(empty.to_json()["stats"].get("minecraft:custom").is_none());
+
+        // With an inline tick counter present, resetting a non-tick custom key stores 0
+        // in minecraft:custom just like pre-PR map storage did.
+        let mut s = Stats::default();
+        s.add_tick_mask(0b00001, true); // play_time
+        s.reset("custom", "minecraft:jump");
+        assert_eq!(
+            s.to_json()["stats"]["minecraft:custom"]["minecraft:jump"],
+            0
+        );
+        assert_eq!(
+            s.to_json()["stats"]["minecraft:custom"]["minecraft:play_time"],
+            1
+        );
     }
 }
