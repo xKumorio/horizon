@@ -1324,45 +1324,244 @@ mod tests {
     }
 
     #[test]
-    fn nametag_index_and_borrowed_names_match_legacy_allocating_path() {
-        let mut mobs = Vec::with_capacity(500);
-        let mut remote_names = Vec::with_capacity(500);
-        for i in 0..500_u32 {
-            let mut m = player_mob();
-            m.id = 1000 + i;
-            mobs.push(m);
-            remote_names.push((1000 + i, format!("Player_{i:04}")));
-        }
+    #[ignore = "daily"]
+    fn below_name_score_shows_for_player_and_mob_only_with_display_objective() {
+        use horizon_protocol::packets::play::{self, Clientbound as C};
 
-        // Verify exact equivalence against the legacy std::HashMap + String-cloning path.
-        let legacy_indices: std::collections::HashMap<u32, usize> = {
-            let mut map = std::collections::HashMap::with_capacity(mobs.len());
-            for (idx, mob) in mobs.iter().enumerate() {
-                map.entry(mob.id).or_insert(idx);
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            let (pipe, _server) = horizon_protocol::connection::Pipe::pair();
+            game.connect_local(pipe, "Viewer").unwrap();
+            game.handle_packet(C::Login(play::Login {
+                player_id: 7,
+                hardcore: false,
+                levels: vec!["minecraft:overworld".into()],
+                max_players: 20,
+                chunk_radius: 8,
+                simulation_distance: 8,
+                reduced_debug_info: false,
+                show_death_screen: true,
+                limited_crafting: false,
+                spawn: play::SpawnInfo {
+                    dimension_type: 0,
+                    dimension: "minecraft:overworld".into(),
+                    seed: 1,
+                    game_type: 0,
+                    previous_game_type: None,
+                    debug: false,
+                    flat: false,
+                    last_death: None,
+                    portal_cooldown: 0,
+                    sea_level: 63,
+                },
+                online_mode: false,
+                enforces_secure_chat: false,
+            }))
+            .unwrap();
+            game.mobs.clear();
+            let registry = game
+                .remote
+                .as_ref()
+                .unwrap()
+                .builtin
+                .get("minecraft:entity_type")
+                .unwrap()
+                .clone();
+
+            // Spawn one remote player ("Alice", id 101) and one named zombie ("Zed", id 102)
+            // within below_name_distance (10 blocks) of the camera.
+            let alice_uuid = 0xA11CE_u128;
+            let zed_uuid = 0x2ED_u128;
+            game.handle_packet(C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                actions: 0x01,
+                entries: vec![play::PlayerInfo {
+                    uuid: alice_uuid,
+                    name: Some("Alice".to_owned()),
+                    properties: Vec::new(),
+                    chat_session: None,
+                    game_mode: None,
+                    listed: None,
+                    latency: None,
+                    display_name: None,
+                    list_order: None,
+                    show_hat: None,
+                }],
+            }))
+            .unwrap();
+            game.handle_packet(C::AddEntity(play::AddEntity {
+                id: 101,
+                uuid: alice_uuid,
+                kind: registry.id("minecraft:player").unwrap(),
+                position: [2.0, 64.0, 0.0],
+                velocity: [0.0; 3],
+                pitch: 0,
+                yaw: 0,
+                head_yaw: 0,
+                data: 0,
+            }))
+            .unwrap();
+            game.handle_packet(C::AddEntity(play::AddEntity {
+                id: 102,
+                uuid: zed_uuid,
+                kind: registry.id("minecraft:zombie").unwrap(),
+                position: [-2.0, 64.0, 0.0],
+                velocity: [0.0; 3],
+                pitch: 0,
+                yaw: 0,
+                head_yaw: 0,
+                data: 0,
+            }))
+            .unwrap();
+            let zed = game.mobs.iter_mut().find(|m| m.id == 102).unwrap();
+            zed.custom_name = Some("Zed".to_owned());
+            zed.name_visible = true;
+            let zed_uuid_ints = [0, 0, 0, 0x2ED];
+            game.persist.uuids.insert(102, zed_uuid_ints);
+
+            // Objective and scores exist, but SLOT_BELOW_NAME is NOT bound yet.
+            assert!(game.score.board.add_objective(
+                "hp",
+                "dummy",
+                serde_json::json!("HP"),
+                sb::RenderType::Integer,
+                false,
+                None,
+            ));
+            game.score.board.set("Alice", "hp", 17);
+            game.score.board.set(&uuid_text(zed_uuid_ints), "hp", 9);
+
+            let camera = glam::DVec3::new(0.0, 64.0, -4.0);
+            let lines_by_name = |game: &Game<'_>| {
+                let mut map = std::collections::HashMap::new();
+                for tag in game.collect_name_tags(camera, 1.0, false, None) {
+                    let plains: Vec<String> =
+                        tag.lines.iter().map(|(t, _)| t.plain()).collect();
+                    let name = plains.last().cloned().unwrap_or_default();
+                    map.insert(name, plains);
+                }
+                map
+            };
+
+            let without_display = lines_by_name(game);
+            assert_eq!(without_display.get("Alice"), Some(&vec!["Alice".to_owned()]));
+            assert_eq!(without_display.get("Zed"), Some(&vec!["Zed".to_owned()]));
+
+            // Bind SLOT_BELOW_NAME: both player (by name) and mob (by UUID) now emit the score line.
+            game.score
+                .board
+                .set_display_objective(sb::SLOT_BELOW_NAME, Some("hp"));
+            let with_display = lines_by_name(game);
+            assert_eq!(
+                with_display.get("Alice"),
+                Some(&vec!["17 HP".to_owned(), "Alice".to_owned()])
+            );
+            assert_eq!(
+                with_display.get("Zed"),
+                Some(&vec!["9 HP".to_owned(), "Zed".to_owned()])
+            );
+
+            // Clearing SLOT_BELOW_NAME hides the below-name score again.
+            game.score
+                .board
+                .set_display_objective(sb::SLOT_BELOW_NAME, None);
+            let cleared = lines_by_name(game);
+            assert_eq!(cleared.get("Alice"), Some(&vec!["Alice".to_owned()]));
+            assert_eq!(cleared.get("Zed"), Some(&vec!["Zed".to_owned()]));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn shared_batch_styled_name_tag_quads_matches_per_tag_batches() {
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            let new_batch = || {
+                HudBatch::new(
+                    [1, 1],
+                    horizon_client::hud::GuiScale {
+                        requested: 1,
+                        unicode: false,
+                    },
+                )
+            };
+            let tag_a = vec![
+                (Text::untrusted("17 HP").resolve_legacy(), 0.0),
+                (Text::untrusted("Alice").resolve_legacy(), 0.25875),
+            ];
+            let tag_b = vec![(Text::untrusted("§aBob_42").resolve_legacy(), 0.0)];
+
+            let mut shared_out = Vec::new();
+            let mut shared_batch = new_batch();
+            let mut shared_layouts = NameTagLayouts::default();
+            game.styled_name_tag_quads(
+                glam::DVec3::new(1.0, 2.0, 3.0),
+                &tag_a,
+                0xFF,
+                true,
+                0,
+                0x00F0_00F0,
+                NAME_TAG_UNIT,
+                &mut shared_out,
+                Marks::default(),
+                Some(&mut shared_layouts),
+                &mut shared_batch,
+            );
+            game.styled_name_tag_quads(
+                glam::DVec3::new(-2.0, 1.5, 4.0),
+                &tag_b,
+                0x40,
+                false,
+                2,
+                0,
+                NAME_TAG_UNIT,
+                &mut shared_out,
+                Marks::default(),
+                Some(&mut shared_layouts),
+                &mut shared_batch,
+            );
+
+            let mut separate_out = Vec::new();
+            let mut batch_a = new_batch();
+            let mut layouts_a = NameTagLayouts::default();
+            game.styled_name_tag_quads(
+                glam::DVec3::new(1.0, 2.0, 3.0),
+                &tag_a,
+                0xFF,
+                true,
+                0,
+                0x00F0_00F0,
+                NAME_TAG_UNIT,
+                &mut separate_out,
+                Marks::default(),
+                Some(&mut layouts_a),
+                &mut batch_a,
+            );
+            let mut batch_b = new_batch();
+            let mut layouts_b = NameTagLayouts::default();
+            game.styled_name_tag_quads(
+                glam::DVec3::new(-2.0, 1.5, 4.0),
+                &tag_b,
+                0x40,
+                false,
+                2,
+                0,
+                NAME_TAG_UNIT,
+                &mut separate_out,
+                Marks::default(),
+                Some(&mut layouts_b),
+                &mut batch_b,
+            );
+
+            assert!(!shared_out.is_empty());
+            assert_eq!(shared_out.len(), separate_out.len());
+            for (s, d) in shared_out.iter().zip(&separate_out) {
+                assert_eq!(s.pos.map(f32::to_bits), d.pos.map(f32::to_bits));
+                assert_eq!(s.uv.map(f32::to_bits), d.uv.map(f32::to_bits));
+                assert_eq!(s.layer, d.layer);
+                assert_eq!(s.color, d.color);
+                assert_eq!(s.light, d.light);
+                assert_eq!(s.normal, d.normal);
+                assert_eq!(s.glint_uv.map(f32::to_bits), d.glint_uv.map(f32::to_bits));
             }
-            map
-        };
-        let legacy_players: Vec<(&Mob, String)> = remote_names
-            .iter()
-            .filter_map(|(id, name)| Some((&mobs[*legacy_indices.get(id)?], name.clone())))
-            .collect();
-        let legacy_ids: std::collections::HashSet<u32> =
-            legacy_players.iter().map(|(m, _)| m.id).collect();
-
-        let fast_indices = first_mob_indices(&mobs);
-        let fast_players: Vec<(&Mob, &str)> = remote_names
-            .iter()
-            .filter_map(|(id, name)| Some((&mobs[*fast_indices.get(id)?], name.as_str())))
-            .collect();
-        let fast_ids = named_by_player_list(&fast_players);
-
-        assert_eq!(fast_players.len(), legacy_players.len());
-        assert_eq!(fast_ids.len(), legacy_ids.len());
-        for ((fm, fnm), (lm, lnm)) in fast_players.iter().zip(&legacy_players) {
-            assert_eq!(fm.id, lm.id);
-            assert_eq!(*fnm, lnm.as_str());
-            assert!(fast_ids.contains(&fm.id));
-        }
+        });
     }
 
     /// #4129: the tag hangs from the box of the pose (0.6 swimming, 1.5

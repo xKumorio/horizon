@@ -1,0 +1,2 @@
+horizon-client game::names::tests::below_name_score_shows_for_player_and_mob_only_with_display_objective lib daily resources
+horizon-client game::names::tests::shared_batch_styled_name_tag_quads_matches_per_tag_batches lib daily resources
