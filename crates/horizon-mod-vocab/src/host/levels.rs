@@ -294,9 +294,11 @@ pub trait LevelsBackend {
     /// finite (NaN or infinite). A minimum above its maximum is the same box
     /// with the two swapped, as vanilla's `AABB`. On a client (`ClientLevel`),
     /// the entities the server tracks to it, other players among them, and the
-    /// window's own player, with the same walk.
+    /// window's own player, with the same walk. A display's zero-size physical
+    /// box intersects when its position is strictly inside the query.
     /// None there before login and for a level it does not show. The walk
-    /// is in entity-list order followed by players. Every entity list is walked
+    /// is in entity-list order, with displays (by entity id on a client)
+    /// before the dragon and the final player entries. Every entity list is walked
     /// once per call: O(entities) regardless of the box. Each overlapping mob
     /// resolves through a mob-list scan: O(K*N) for K overlapping mobs and N mobs. Tridents do not
     /// resolve; frames, paintings and other special entities
@@ -926,6 +928,23 @@ pub trait LevelsBackendMut {
         chunk: ChunkRef,
         controller: TicketController,
         owner: TicketOwner,
+        forced: bool,
+        natural_spawning: bool,
+    ) -> bool;
+    /// Side: server.
+    /// Hold or release a runtime-only ticket of `controller` on this chunk for
+    /// `operation`, an id the mod picks (a teleport search, say): true when the
+    /// controller's tickets changed. It holds the chunk as `chunk_set_mod_forced`
+    /// does, with the same refusals, and is scoped by (controller, operation,
+    /// chunk, natural_spawning). It is never saved, never handed to
+    /// `validate_tickets` and never listed by `mod_forced_chunks`; it ends when
+    /// the level closes.
+    #[access(WorldOnly)]
+    fn chunk_set_transient_forced(
+        &mut self,
+        chunk: ChunkRef,
+        controller: TicketController,
+        operation: u128,
         forced: bool,
         natural_spawning: bool,
     ) -> bool;

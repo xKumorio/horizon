@@ -697,14 +697,19 @@ impl Launcher {
                     cx.notify();
                 })),
             )
-            .child(
-                ui::icon_button("native-build-cancel", "stop", 32., 16., radius, false, &t)
-                    .tooltip(ui::tip(tr("Stop the build")))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.stop_native_build();
-                        cx.notify();
-                    })),
-            );
+            .child({
+                let stop =
+                    ui::icon_button("native-build-cancel", "stop", 32., 16., radius, false, &t);
+                match self.native_stopping {
+                    true => stop.opacity(0.4).cursor_default(),
+                    false => stop
+                        .tooltip(ui::tip(tr("Stop the build")))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.stop_native_build();
+                            cx.notify();
+                        })),
+                }
+            });
         let bar = div()
             .h(px(6.))
             .w_full()
@@ -868,12 +873,13 @@ impl Launcher {
                     headline,
                     line,
                     actions,
+                    pending_actions,
                 } => (
                     "information-circle",
                     pal.warn,
                     headline.clone().into(),
                     match stop.filter(|stake| stake.mods.iter().any(|id| id == mod_id)) {
-                        Some(_) => format!("{line}\n{}", native_mods::fit::actions_pending(mod_id)),
+                        Some(_) => format!("{line}\n{pending_actions}"),
                         None => format!("{line}\n{actions}"),
                     },
                 ),

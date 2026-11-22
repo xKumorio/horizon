@@ -67,6 +67,14 @@ vanilla camera. Requests from later render callbacks apply at the next frame's e
 Setting a type never emits `camera_type_cycle`; F5 alone cycles, and its final event choice
 wins over requests made inside the cycle callback.
 
+`camera_roll` turns the drawn camera about its view direction, in degrees, right after
+`camera_pose`: at 90 the world's up is at the screen's left, as NeoForge's
+`ViewportEvent.ComputeCameraAngles` roll. It starts at 0 each frame, is neither bounded nor
+scaled by Distortion Effects (unlike `camera_shake`), and a value that isn't finite is 0. The
+world, its culling, the billboards facing the camera and `Camera.view` follow it; the
+first-person hand and the HUD stay level. It is a hook of its own rather than a field of
+`CameraPoseEvent` so that wasm mods built before it keep loading.
+
 ## Viewed levels
 
 A server can open other levels for a client to view besides the one the player is in (`horizon:levels`,
@@ -94,7 +102,7 @@ A map drawing past the loaded chunks reads the far terrain the player already se
 block, the water's top and the biome) from the finest far tile sampled over it, whether or not
 its chunk is loaded. A far tile's cell can be many blocks wide, so a far column is that cell's
 reduced surface, and it comes from wherever the far terrain does: the world's generator, the
-server's offer, chunks kept from earlier visits or a server's BlueMap. It reads nothing new
+server's offer or chunks kept from earlier visits. It reads nothing new
 from the server.
 
 A column no tile covers yet is `None`, and every column is `None` while far terrain is off

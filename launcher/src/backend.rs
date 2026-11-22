@@ -1062,6 +1062,47 @@ pub fn version_dir(tag: &str) -> PathBuf {
 
 pub(crate) const COMPLETE: &str = ".installed";
 
+/// Whether version `tag` is still installed: its folder holds the mark an install ends with. A
+/// player may delete `versions` (or one version's folder) while the window keeps the list it read.
+pub fn is_installed(tag: &str) -> bool {
+    version_dir(tag).join(COMPLETE).exists()
+}
+
+/// The first of `tags` no longer installed, with the installed versions read again, for a window
+/// whose list is older than the disk ([`is_installed`]).
+pub fn gone(tags: &[&str]) -> Option<(String, Vec<String>)> {
+    gone_from(&versions_dir(), tags)
+}
+
+/// The installed versions read again when `tag` is installed after all: another launcher or the
+/// command line may take a version's mark away for a moment while it replaces it, so Reinstall
+/// looks once more before downloading it.
+pub fn installed_again(tag: &str) -> Option<Vec<String>> {
+    installed_again_in(&versions_dir(), tag)
+}
+
+fn installed_again_in(versions: &Path, tag: &str) -> Option<Vec<String>> {
+    gone_from(versions, &[tag])
+        .is_none()
+        .then(|| installed_in(versions))
+}
+
+fn gone_from(versions: &Path, tags: &[&str]) -> Option<(String, Vec<String>)> {
+    let gone = tags
+        .iter()
+        .find(|tag| !versions.join(tag).join(COMPLETE).exists())?;
+    Some((gone.to_string(), installed_in(versions)))
+}
+
+/// What Prepare and Play say when the version they were asked for is no longer installed: `name`
+/// is the version as the window names it.
+pub fn version_gone(name: &str) -> String {
+    crate::i18n::trf(
+        "{version} is no longer on this computer.",
+        &[("version", name)],
+    )
+}
+
 /// Installed versions, newest tag first.
 pub fn installed() -> Vec<String> {
     installed_in(&versions_dir())
@@ -1075,8 +1116,42 @@ fn installed_in(versions: &Path) -> Vec<String> {
         .filter(|e| e.path().join(COMPLETE).exists())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    tags.sort_by(|a, b| compare_versions(b, a));
+    // Read once: a later release list notes the times itself.
+    static READ_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !newest_first(&mut tags, crate::nightly::published_at)
+        && !READ_KEPT.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        // Two Nightlies of one day before a release list was read: when they came out is in the
+        // copy of the list kept on disk.
+        if let Some(list) = crate::github::kept(&release_list_url()) {
+            crate::nightly::note_published(&game_releases(&list));
+        }
+        newest_first(&mut tags, crate::nightly::published_at);
+    }
     tags
+}
+
+/// Sorts `tags` newest first: by [`release_order`], then Nightlies of one day by when they came
+/// out (`published`, `YYYY-MM-DD HH:MM` UTC), then by the tag, so the order never depends on the
+/// folder listing. False when two Nightlies of one day had no time to tell them apart.
+fn newest_first(tags: &mut [String], published: impl Fn(&str) -> Option<String>) -> bool {
+    let mut keyed: Vec<_> = tags
+        .iter()
+        .map(|t| {
+            let when = crate::nightly::date_of(t).and_then(|_| published(t));
+            (release_order(t), when, t.clone())
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.cmp(a));
+    let told_apart = keyed.windows(2).all(|w| {
+        !(matches!(w[0].0, ReleaseOrder::Nightly(_))
+            && w[0].0 == w[1].0
+            && (w[0].1.is_none() || w[1].1.is_none()))
+    });
+    for (slot, (_, _, tag)) in tags.iter_mut().zip(keyed) {
+        *slot = tag;
+    }
+    told_apart
 }
 
 /// A small release file (its checksums or their signature), whole; None when it has none.
@@ -1136,10 +1211,24 @@ pub(crate) fn save_checked(
     to: &Path,
     progress: &impl Fn(f32),
 ) -> Result<(), String> {
+    save_checked_until(reader, size, name, sha256, to, progress, &|| Ok(()))
+}
+
+/// [`save_checked`] that asks `stop` before each chunk it reads: its error ends the download at
+/// once, word for word, and the temporary file is removed.
+pub(crate) fn save_checked_until(
+    reader: impl Read,
+    size: u64,
+    name: &str,
+    sha256: &str,
+    to: &Path,
+    progress: &impl Fn(f32),
+    stop: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let mut temp = to.as_os_str().to_owned();
     temp.push(format!(".part-{}", std::process::id()));
     let temp = PathBuf::from(temp);
-    let saved = write_checked(reader, size, name, sha256, &temp, progress)
+    let saved = write_checked(reader, size, name, sha256, &temp, progress, stop)
         .and_then(|()| fs::rename(&temp, to).map_err(|e| e.to_string()));
     if saved.is_err() {
         let _ = fs::remove_file(&temp);
@@ -1154,11 +1243,13 @@ fn write_checked(
     sha256: &str,
     to: &Path,
     progress: &impl Fn(f32),
+    stop: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let mut file = fs::File::create(to).map_err(|e| e.to_string())?;
     let mut hash = horizon_release_sign::Sha256::default();
     let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
     loop {
+        stop()?;
         let n = reader
             .read(&mut buf)
             .map_err(|e| format!("Download interrupted: {e}"))?;
@@ -1874,18 +1965,20 @@ pub fn complete_assets(tag: &str) {
     });
 }
 
-/// Horizon's own download (an owner's) may have stopped before the sounds and the languages,
-/// and the copies of `complete_assets` read them from its store: asked again, once per run, through
-/// the same owner gate as any download from Mojang (`download_for_owner`), which keeps the files
-/// already whole. Called where a download is expected (`reuse_prepared_everywhere`), never on Play.
+fn should_refill_own_store(own: &Path, resources: &Path) -> bool {
+    own.join("assets/indexes").is_dir() && !prepare::missing_extras(resources).is_empty()
+}
+
+/// Horizon's own download (an owner's) may have stopped before the extras (such as fonts, sounds,
+/// or languages), and the copies of `complete_assets` read them from its store: asked again, once per
+/// run, through the same owner gate as any download from Mojang (`download_for_owner`), which keeps
+/// the files already whole. Called where a download is expected (`reuse_prepared_everywhere`), never
+/// on Play.
 fn refill_own_store(tag: &str) {
     static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let own = data_dir().join("minecraft");
     let resources = resources_at(&versions_dir().join(tag));
-    if !own.join("assets/indexes").is_dir()
-        || !prepare::missing_extras(&resources)
-            .iter()
-            .any(|(kind, _)| matches!(*kind, "languages" | "sounds"))
+    if !should_refill_own_store(&own, &resources)
         || ASKED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         return;
@@ -1970,7 +2063,7 @@ fn minecraft_folders() -> Vec<PathBuf> {
     let mut folders: Vec<PathBuf> = Settings::load().minecraft_dir.into_iter().collect();
     folders.extend([
         prepare::artifacts::minecraft_dir(None),
-        data_dir().join("linked-minecraft"),
+        data_dir().join(sources::LINKED),
         data_dir().join("minecraft"),
     ]);
     folders.extend(
@@ -2310,7 +2403,7 @@ fn assets_folder(
 ) -> PathBuf {
     match resolved {
         Ok(sources::Resolved::Folder(dir)) => dir,
-        Ok(sources::Resolved::NotFound(_)) => {
+        Ok(sources::Resolved::NotFound(..)) => {
             log(format!(
                 "Minecraft {version}'s assets were not found in any launcher folder: the game \
                  will be silent and the title screen plain"
@@ -2321,6 +2414,27 @@ fn assets_folder(
             log(format!("Minecraft {version}'s assets: {e}"));
             chosen.to_path_buf()
         }
+    }
+}
+
+/// Why no Minecraft folder could be prepared from, after the download from Mojang failed with
+/// `download` (a line starting with a bullet). Folders that have the game but lack `incomplete` (a
+/// library's file name) get one short sentence, and the window offers the download again
+/// ([`prepare_offers_mojang`]); otherwise every folder looked in, with what it lacks.
+fn incomplete_or_not_found(
+    version: &str,
+    checked: &[(PathBuf, String)],
+    chosen: &Path,
+    incomplete: Option<String>,
+    download: &str,
+) -> String {
+    match incomplete {
+        Some(file) => {
+            MOJANG_OFFERED.store(true, std::sync::atomic::Ordering::Relaxed);
+            let why = download.trim_start_matches("\n  • ");
+            format!("{} {why}", sources::incomplete(version, &file))
+        }
+        None => sources::not_found(version, checked, chosen) + download,
     }
 }
 
@@ -2369,6 +2483,15 @@ pub fn set_prepare_step(step: PrepareStep) {
     PREPARE_STEP.store(step as usize, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Set when the last [`preparer`] failed because the only Minecraft folders with the game lack a
+/// library and the download from Mojang didn't happen: the window then offers that download.
+static MOJANG_OFFERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the last failed preparation offers Download from Mojang ([`MOJANG_OFFERED`]).
+pub fn prepare_offers_mojang() -> bool {
+    MOJANG_OFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Checks what the preparation needs and picks how to run it. PLAY.txt describes the same
 /// steps: the player's own launcher install, the server jar from that version's own json, and
 /// Java (and Python, for versions before horizon-prepare). Also returns the Minecraft folder
@@ -2381,6 +2504,11 @@ pub fn preparer(
     log: &dyn Fn(String),
 ) -> Result<(Preparer, PathBuf), String> {
     set_prepare_step(PrepareStep::Files);
+    // Deleted while the window was open: never the folder's OS error from the steps below.
+    if !is_installed(tag) {
+        return Err(version_gone(tag));
+    }
+    MOJANG_OFFERED.store(false, std::sync::atomic::Ordering::Relaxed);
     let version = game_version(tag);
     let dir = version_dir(tag);
     let reused = prepare::artifacts::reuse_imported(&dir, &|line| log(line.to_string()))?;
@@ -2398,22 +2526,35 @@ pub fn preparer(
                 .unwrap_or_default(),
         );
         let fetch = crate::downloads::install_metadata;
-        let linked = data_dir().join("linked-minecraft");
+        let linked = data_dir().join(sources::LINKED);
         if from == MinecraftFrom::Mojang {
             // Straight from Mojang (what is already there and whole is kept), for an owner only.
             download_for_owner(&pins, &own, &fetch, log)
                 .map_err(|e| e.trim_start_matches("\n  • ").to_string())?;
             own
         } else {
-            let resolved = sources::resolve(minecraft, &pins, &known, &linked, &fetch, log);
+            // Reused game files need only the assets: a folder missing libraries still has them.
+            // Otherwise a library this version already imported needn't be in the folder.
+            let imported = prepare::artifacts::Lock::read(&dir).map(|lock| lock.directory);
+            let whole = imported.as_ref().ok().filter(|_| !reused);
+            let resolved = sources::resolve(
+                minecraft,
+                &pins,
+                &known,
+                &linked,
+                whole.map(PathBuf::as_path),
+                &fetch,
+                log,
+            );
             if reused {
                 assets_folder(resolved, &chosen, &version, log)
             } else {
                 match resolved? {
                     sources::Resolved::Folder(dir) => dir,
-                    sources::Resolved::NotFound(checked) => {
-                        let not_found = sources::not_found(&version, &checked, minecraft);
-                        download_for_owner(&pins, &own, &fetch, log).map_err(|e| not_found + &e)?;
+                    sources::Resolved::NotFound(checked, incomplete) => {
+                        download_for_owner(&pins, &own, &fetch, log).map_err(|e| {
+                            incomplete_or_not_found(&version, &checked, minecraft, incomplete, &e)
+                        })?;
                         own
                     }
                 }
@@ -3045,7 +3186,7 @@ pub fn remove_version(tag: &str) -> Result<(), String> {
     crate::storage::eviction::request_cleanup();
     let mut settings = Settings::load();
     if settings.selected.as_deref() == Some(tag) {
-        settings.selected = installed().first().cloned();
+        settings.keep_installed_selection(&installed());
         settings.save()?;
     }
     Ok(())
@@ -3457,7 +3598,7 @@ pub fn check_updates() -> Result<Updates, String> {
 }
 
 mod update_selection;
-pub use update_selection::select_after_update;
+pub use update_selection::{select_after_update, selection_after_install, InstallCause};
 
 /// Installs `tag` (or with "latest" the newest release, pre-releases left out), then updates the selection as
 /// `select_after_update` says when `as_update`, or always selects it otherwise.
@@ -3467,13 +3608,13 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
         releases
             .iter()
             .find(|r| r.asset.is_some() && !r.prerelease)
-            .ok_or("No release has a build for this platform yet.")?
+            .ok_or_else(|| crate::refusals::no_build(None))?
     } else {
         release_selection::by_tag(&releases, tag)
             .ok_or_else(|| format!("No Horizon release is tagged {tag}."))?
     };
     if release.asset.is_none() {
-        return Err(format!("{} has no build for this platform.", release.tag));
+        return Err(crate::refusals::no_build(Some(&release.tag)));
     }
     let before = installed();
     let downgrade = nightly_downgrade(release, &before);
@@ -3486,12 +3627,25 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
             eprintln!("Could not mark updated Nightly {}: {e}", release.tag);
         }
     }
-    let mut settings = Settings::load();
+    let mut settings = Settings::load_for_install(&before);
     // An older Nightly is a deliberate rollback: installed, but an update never moves the selection back.
-    let select = !as_update
-        || (downgrade.is_none() && select_after_update(settings.selected.as_deref(), &before));
-    if select {
-        settings.selected = Some(release.tag.clone());
+    let changed = match (as_update, &downgrade) {
+        (false, _) => {
+            settings.pick(release.tag.clone());
+            true
+        }
+        (true, Some(_)) => false,
+        (true, None) => settings.apply_install(
+            &release.tag,
+            &before,
+            &installed(),
+            InstallCause {
+                update: true,
+                instance: None,
+            },
+        ),
+    };
+    if changed {
         settings.save()?;
     }
     if as_update && release.nightly.is_some() {
@@ -4235,6 +4389,8 @@ pub enum Job {
 pub struct Running {
     pub child: Arc<Mutex<Child>>,
     pub stdin: Option<ChildStdin>,
+    /// Set before `Msg::Exit` when the game refused its folder leases (exit 78).
+    pub leases_refused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Launcher-owned tree-lock primitives and optional Windows runtime state.
@@ -4268,9 +4424,10 @@ pub fn prepare_command(cmd: Command) -> Result<(Command, RuntimeGuard), String> 
             Vec::new()
         }
         Err(error @ crate::native_cache::Error::Io(_)) => {
-            return Err(crate::i18n::trf(
-                "{error}. Make sure your account can write to the game's and the launcher's folders, then try again.",
-                &[("error", &crate::native_mods::cache_error(error))],
+            return Err(crate::refusals::unwritable(
+                &crate::native_mods::cache_error(error),
+                cmd.get_current_dir(),
+                &data_dir(),
             ));
         }
         Err(error) => return Err(crate::native_mods::cache_error(error)),
@@ -4320,6 +4477,7 @@ pub fn spawn(job: Job, cmd: Command, tx: Sender<Msg>) -> Result<Running, String>
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let direct = job == Job::Client && crate::refusals::runs_horizon_directly(&cmd);
     let mut child = play_log::spawn(&mut cmd)?;
     let stdin = child.stdin.take();
     let mut readers = Vec::new();
@@ -4341,6 +4499,8 @@ pub fn spawn(job: Job, cmd: Command, tx: Sender<Msg>) -> Result<Running, String>
     }
     let child = Arc::new(Mutex::new(child));
     let waited = child.clone();
+    let leases_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refused = leases_refused.clone();
     std::thread::spawn(move || {
         for r in readers {
             let _ = r.join();
@@ -4353,312 +4513,26 @@ pub fn spawn(job: Job, cmd: Command, tx: Sender<Msg>) -> Result<Running, String>
         };
         let result = match status {
             Ok(s) if s.success() => Ok(()),
-            Ok(s) => Err(format!("Exited with {s}")),
+            Ok(s) => {
+                let exit = crate::refusals::exit_error(direct, s);
+                // Ordered before the send: the window reads it when the exit arrives.
+                refused.store(exit.leases_refused, std::sync::atomic::Ordering::SeqCst);
+                Err(exit.text)
+            }
             Err(e) => Err(e.to_string()),
         };
         drop(runtime);
         let _ = tx.send(Msg::Exit(job, result));
     });
-    Ok(Running { child, stdin })
+    Ok(Running {
+        child,
+        stdin,
+        leases_refused,
+    })
 }
 
-/// The launcher's appearance, as older launchers saved it: a theme is one look now, and a saved
-/// `light` opens on the Taiga theme (`Settings::parse`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Appearance {
-    #[default]
-    Dark,
-    Light,
-    /// Follow the system's light or dark.
-    System,
-}
-
-/// What the launcher's window does while the game runs, as the player picks it in Settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WhilePlaying {
-    /// The window stays where it is.
-    #[default]
-    Stay,
-    /// The window goes to the Dock or the taskbar, and comes back when the game closes.
-    Minimize,
-    /// The launcher hides (macOS only: elsewhere it minimises), and comes back when the game
-    /// closes.
-    Hide,
-}
-
-impl WhilePlaying {
-    pub const ALL: [WhilePlaying; 3] = [Self::Stay, Self::Minimize, Self::Hide];
-
-    /// Its name in `settings.json` and on the command line.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Stay => "stay",
-            Self::Minimize => "minimize",
-            Self::Hide => "hide",
-        }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        let name = name.trim().to_ascii_lowercase();
-        let name = match name.as_str() {
-            "minimise" => "minimize",
-            "keep" | "open" | "off" => "stay",
-            n => n,
-        };
-        Self::ALL.into_iter().find(|w| w.name() == name)
-    }
-
-    /// What this computer does for it: only macOS can hide a whole app.
-    pub fn here(self) -> Self {
-        match self {
-            Self::Hide if !cfg!(target_os = "macos") => Self::Minimize,
-            w => w,
-        }
-    }
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct Settings {
-    pub selected: Option<String>,
-    /// Game asset architecture. Auto preserves the launcher's process-architecture behavior.
-    #[serde(default)]
-    pub game_architecture: GameArchitecture,
-    /// The instance Play starts (`instances`), by id. Unset means Horizon, the game's home.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<String>,
-    pub minecraft_dir: Option<PathBuf>,
-    pub server_dir: Option<PathBuf>,
-    /// Unset means on: only a player who turned it off has `false` here. 0.1.1 wrote its
-    /// `auto_install` (off by default) for everyone, so this is a new key and that one is ignored.
-    #[serde(default)]
-    pub install_new_versions: Option<bool>,
-    /// Unset means on: after an install the launcher deletes the release versions nothing needs
-    /// (`prune_old_versions`). Only a player who turned it off has `false` here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prune_old_versions: Option<bool>,
-    /// How many of the newest release versions pruning keeps. Unset means [`KEEP_NEWEST`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_versions: Option<usize>,
-    /// Off by default, so the opening animation shows unless the player turns it off.
-    #[serde(default)]
-    pub skip_opening: bool,
-    /// Linux: whether the launcher keeps its entry in the applications menu (`desktop`). Unset
-    /// means yes; removing the entry stores `false`, so it doesn't come back on the next start.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desktop_entry: Option<bool>,
-    /// Extra arguments for the game's command line, as one line (see [`split_args`]). Empty by
-    /// default. Appended after the launcher's own arguments, so they can add to or override them.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub game_args: String,
-    /// The proxy every download goes through (`proxy`), such as `http://127.0.0.1:7890` or
-    /// `socks5://127.0.0.1:1080`.
-    /// Unset means none: the environment's `HTTPS_PROXY` and `HTTP_PROXY` apply instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    /// Only read to move an old light appearance to the Taiga theme (`parse`): always dark now,
-    /// a theme being one look.
-    #[serde(default)]
-    pub appearance: Appearance,
-    /// The player has read what the "I'm playing" ping holds (`telemetry::PING`): on the
-    /// first-run question, or on the Play page once if they answered that before it existed.
-    #[serde(default)]
-    pub ping_notice_seen: bool,
-    /// The player turned the anonymous "I'm playing" ping off (`telemetry::PING`): the game is
-    /// started with `HORIZON_NO_HEARTBEAT`. On by default, as upstream sends it.
-    #[serde(default)]
-    pub ping_off: bool,
-    /// The look's flourishes, each on or off (`effects`): glow, gradients, the hover shine.
-    #[serde(default)]
-    pub effects: crate::effects::Effects,
-    /// The player has been through the first-run welcome (theme, accent, effects).
-    #[serde(default)]
-    pub welcomed: bool,
-    /// The player without an account that owns the game has read, once, why the launcher needs
-    /// one now (the owner gate's screen).
-    #[serde(default)]
-    pub owner_notice_seen: bool,
-    /// Seconds a partner banner (the sidebar's card or the Servers page's banner) has been on
-    /// screen, over every start, up to `partner::SEEN_BEFORE_HIDE`: only then can the player hide it.
-    #[serde(default)]
-    pub partner_seen_secs: u64,
-    /// The player hid a partner banner: the sidebar's card and the Servers page's banner are both gone for good.
-    #[serde(default)]
-    pub partner_hidden: bool,
-    /// What the window does while the game runs. Stays by default.
-    #[serde(default)]
-    pub while_playing: WhilePlaying,
-    /// The accent colour on top of the appearance (`themes::Accent`). Horizon's violet by default.
-    #[serde(default)]
-    pub accent: crate::themes::Accent,
-    /// How much white the glass look's plates take, in percent (the mockup's Glass, 0 to 16).
-    /// Unset is the mockup's 6.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glass: Option<f32>,
-    /// How much the glass look's plates blur the scene behind them, in px (0 to 48). Unset is
-    /// the mockup's 24.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blur: Option<f32>,
-    /// The launcher theme (`themes::theme`): its sky behind the light appearance. Unset is
-    /// Horizon's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<String>,
-    /// The cheaper scene for older computers (a lower-resolution sky, a box blur, the scene
-    /// following the mouse less often and resizes baked in the background). Unset is off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance: Option<bool>,
-    /// Home's background: a picture the player picked, kept in the data folder under this name
-    /// (`themes::keep_background`). Unset shows Horizon's landscape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background: Option<String>,
-    /// The window's language. Unset follows the system's (`i18n::Language::system`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<crate::i18n::Language>,
-    /// Whether what the browser installed from Horizon's registry updates by itself, at start
-    /// and before Play (`browser::horizon::auto`). Unset is on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mods_auto_update: Option<bool>,
-    /// First-use native code permission for this launcher install, Unix seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_mods_allowed_at: Option<u64>,
-    /// Managed cache limit in GiB (unset: 25; zero: no automatic cleanup). Player data isn't cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_limit_gib: Option<u64>,
-    /// The accent picked under each launcher theme, by its id (`themes::HORIZON` for Horizon's
-    /// own), so going back to a theme brings back its colour. A launcher older than this map
-    /// drops it when it saves: the themes then only start from their own accents again.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub theme_accents: std::collections::BTreeMap<String, crate::themes::Accent>,
-    /// Reduced motion: unset follows the system's, true keeps the launcher still, false lets it
-    /// move even when the system asks for less.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reduce_motion: Option<bool>,
-}
-
-impl Settings {
-    /// Remember an explicit approval; merely finding an installed toolchain never grants it.
-    pub fn allow_native_mods(&mut self) -> Result<(), String> {
-        self.native_mods_allowed_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_secs(),
-        );
-        self.save()
-    }
-
-    pub fn load() -> Self {
-        Self::parse(&fs::read_to_string(data_dir().join("settings.json")).unwrap_or_default())
-    }
-    pub fn parse(text: &str) -> Self {
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Self::default();
-        };
-        if let Some(fields) = value.as_object_mut() {
-            // An appearance from a newer launcher is Dark, not a reason to lose every setting.
-            if fields
-                .get("appearance")
-                .is_some_and(|a| serde_json::from_value::<Appearance>(a.clone()).is_err())
-            {
-                fields.remove("appearance");
-            }
-            if fields
-                .get("while_playing")
-                .is_some_and(|w| serde_json::from_value::<WhilePlaying>(w.clone()).is_err())
-            {
-                fields.remove("while_playing");
-            }
-            if fields
-                .get("game_architecture")
-                .is_some_and(|a| serde_json::from_value::<GameArchitecture>(a.clone()).is_err())
-            {
-                fields.remove("game_architecture");
-            }
-            if fields.get("accent").is_some_and(|a| {
-                serde_json::from_value::<crate::themes::Accent>(a.clone()).is_err()
-            }) {
-                fields.remove("accent");
-            }
-            // A glass or blur that isn't a number is the default, not a reason to lose the rest.
-            for key in ["glass", "blur"] {
-                if fields.get(key).is_some_and(|v| !v.is_number()) {
-                    fields.remove(key);
-                }
-            }
-            look_settings::tidy(fields);
-            // A language this launcher doesn't have yet follows the system's.
-            if fields.get("language").is_some_and(|l| {
-                serde_json::from_value::<Option<crate::i18n::Language>>(l.clone()).is_err()
-            }) {
-                fields.remove("language");
-            }
-        }
-        let mut settings: Self = serde_json::from_value(value).unwrap_or_default();
-        look_settings::settle(&mut settings);
-        settings
-    }
-    /// Whether the launcher keeps its entry in the applications menu (Linux).
-    pub fn desktop_entry(&self) -> bool {
-        self.desktop_entry.unwrap_or(true)
-    }
-    /// The window's language: the one picked, else the system's.
-    pub fn language(&self) -> crate::i18n::Language {
-        self.language.unwrap_or_else(crate::i18n::Language::system)
-    }
-    /// Whether new Horizon versions are installed automatically.
-    pub fn auto_install(&self) -> bool {
-        self.install_new_versions.unwrap_or(true)
-    }
-    /// Whether old versions are deleted after an install.
-    pub fn auto_prune(&self) -> bool {
-        self.prune_old_versions.unwrap_or(true)
-    }
-    /// The plates' white as a fraction (0 to 0.16): [`glass`](Self::glass) in percent.
-    pub fn glass_tint(&self) -> f32 {
-        self.glass
-            .filter(|v| v.is_finite())
-            .map_or(horizon_theme::glass::TINT, |v| v.clamp(0., 16.) / 100.)
-    }
-    /// The plates' blur in px (0 to 48).
-    pub fn glass_blur(&self) -> f32 {
-        self.blur
-            .filter(|v| v.is_finite())
-            .map_or(horizon_theme::glass::BLUR, |v| v.clamp(0., 48.))
-    }
-    /// Whether the cheaper scene is on ([`performance`](Self::performance)).
-    pub fn performance(&self) -> bool {
-        self.performance.unwrap_or(false)
-    }
-    /// Registry mods update by themselves ([`Settings::mods_auto_update`]): on unless turned off.
-    pub fn auto_updates_mods(&self) -> bool {
-        self.mods_auto_update.unwrap_or(true)
-    }
-    /// How many of the newest release versions pruning keeps: at least the newest.
-    pub fn keep_newest(&self) -> usize {
-        self.keep_versions.unwrap_or(KEEP_NEWEST).max(1)
-    }
-    pub fn save(&self) -> Result<(), String> {
-        // The window and background jobs share the process's temporary file.
-        static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // A write that stops halfway leaves settings.json unreadable, and `load` answers
-        // defaults for it: the file is replaced only once it is whole.
-        let dir = data_dir();
-        let path = dir.join("settings.json");
-        let tmp = dir.join(format!("settings.{}.tmp", std::process::id()));
-        let json =
-            serde_json::to_vec_pretty(self).map_err(|e| format!("{}: {e}", path.display()))?;
-        let written = fs::create_dir_all(&dir)
-            .and_then(|()| fs::write(&tmp, json))
-            .and_then(|()| fs::rename(&tmp, &path));
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("{}: {e}", path.display()));
-        }
-        Ok(())
-    }
-}
+mod settings;
+pub use settings::{Appearance, Settings, WhilePlaying};
 
 #[cfg(test)]
 #[path = "backend/release_loading_tests.rs"]
@@ -4698,6 +4572,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::failed_removal_is_incomplete_and_can_be_retried"
                 ])
@@ -4755,6 +4630,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_version_whose_client_predates_runtime_leases_is_removed"
                 ])
@@ -4807,6 +4683,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_running_legacy_version_is_refused_whole_and_removed_once_it_closes"
                 ])
@@ -4859,6 +4736,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_version_a_native_build_takes_its_resources_from_is_kept"
                 ])
@@ -5175,7 +5053,7 @@ pub fn {f}("
         let fetch = |_: &str| Ok(manifest.to_vec());
         let lines = std::cell::RefCell::new(Vec::new());
         let log = |line: String| lines.borrow_mut().push(line);
-        let resolved = sources::resolve(&instance, &pins, &[], &linked, &fetch, &log);
+        let resolved = sources::resolve(&instance, &pins, &[], &linked, None, &fetch, &log);
         let folder = assets_folder(resolved, &instance, "26.3", &log);
         assert_eq!(folder, linked);
         assert!(folder.join("assets/indexes/34.json").is_file());
@@ -5183,7 +5061,7 @@ pub fn {f}("
         // Nothing found: the chosen folder, and a line saying what the game will lack.
         let empty = dir.join("empty");
         fs::create_dir_all(&empty).unwrap();
-        let resolved = sources::resolve(&empty, &pins, &[], &linked, &fetch, &log);
+        let resolved = sources::resolve(&empty, &pins, &[], &linked, None, &fetch, &log);
         assert_eq!(assets_folder(resolved, &empty, "26.3", &log), empty);
         assert!(lines.borrow().last().unwrap().contains("will be silent"));
         fs::remove_dir_all(&dir).unwrap();
@@ -5196,6 +5074,7 @@ pub fn {f}("
             let home = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::native_resources_resolve_to_the_base_and_prevent_its_removal",
                     "--nocapture"
@@ -6418,6 +6297,40 @@ pub fn {f}("
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A stopped download reads nothing after the stop, ends with the stop's words and keeps
+    /// no temporary file (#19300).
+    #[test]
+    fn a_stopped_download_reads_no_further_and_keeps_nothing() {
+        struct Endless<'a>(&'a std::cell::Cell<u32>);
+        impl Read for Endless<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                buf.fill(7);
+                Ok(buf.len())
+            }
+        }
+        let dir = scratch("save-stopped");
+        let to = dir.join("download.zip");
+        let reads = std::cell::Cell::new(0);
+        let stop = || match reads.get() >= 3 {
+            true => Err("stopped".to_string()),
+            false => Ok(()),
+        };
+        let result = save_checked_until(
+            Endless(&reads),
+            1 << 30,
+            "asset",
+            &horizon_release_sign::sha256_hex(b""),
+            &to,
+            &|_: f32| {},
+            &stop,
+        );
+        assert_eq!(result.unwrap_err(), "stopped");
+        assert_eq!(reads.get(), 3);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_process_that_has_exited_is_not_alive() {
         assert!(process_alive(std::process::id()));
@@ -6666,6 +6579,343 @@ pub fn {f}("
             Some("imported-2026-11-01-abcdef0"),
             &["imported-2026-11-01-abcdef0".to_string()]
         ));
+    }
+
+    #[test]
+    fn an_instance_install_of_a_newer_nightly_moves_a_following_selection_not_a_pick() {
+        let (n18, n19, n20) = (
+            "nightly-2026-11-18-dd67b76",
+            "nightly-2026-11-19-f00125f",
+            "nightly-2026-11-20-0a875da",
+        );
+        let list = |tags: &[&str]| tags.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let pinned = |nightly| InstallCause {
+            update: false,
+            instance: Some(nightly),
+        };
+        let update = InstallCause {
+            update: true,
+            instance: None,
+        };
+        // A follower on n18; an instance pinned to n19 on Nightly installs it: the selection
+        // follows, and the next update moves it on again.
+        let (before, now) = (list(&[n18]), list(&[n19, n18]));
+        assert_eq!(
+            selection_after_install(Some(n18), Some(n18), n19, &before, &now, pinned(true)),
+            Some(true)
+        );
+        let (before, now) = (list(&[n19, n18]), list(&[n20, n19, n18]));
+        assert_eq!(
+            selection_after_install(Some(n19), Some(n19), n20, &before, &now, update),
+            Some(true)
+        );
+        // Use on the older n18 over n19: neither an instance's n20 nor the update moves it.
+        assert_eq!(
+            selection_after_install(Some(n18), Some(n19), n20, &before, &now, pinned(true)),
+            None
+        );
+        assert_eq!(
+            selection_after_install(Some(n18), Some(n19), n20, &before, &now, update),
+            None
+        );
+        // n19 installed by hand while it was the newest (or a settings file from before
+        // `following`): a pick, which an instance's n20 leaves. An update still moves it, as
+        // before, and from then on it follows.
+        assert_eq!(
+            selection_after_install(Some(n19), None, n20, &before, &now, pinned(true)),
+            None
+        );
+        assert_eq!(
+            selection_after_install(Some(n19), None, n20, &before, &now, update),
+            Some(true)
+        );
+        // Use on the newest, the way back the picker names: the next update follows on.
+        assert_eq!(
+            selection_after_install(Some(n19), Some(n18), n20, &before, &now, update),
+            Some(true)
+        );
+        // Home's Stable update, or a Stable instance: never moves a selection the launcher has.
+        assert_eq!(
+            selection_after_install(Some(n19), Some(n19), n20, &before, &now, pinned(false)),
+            None
+        );
+        // An older build for an instance never moves the selection back.
+        let (before, now) = (list(&[n20, n19]), list(&[n20, n19, n18]));
+        assert_eq!(
+            selection_after_install(Some(n20), Some(n20), n18, &before, &now, pinned(true)),
+            None
+        );
+        // Installed by hand: selected as a pick, never followed.
+        let by_hand = InstallCause {
+            update: false,
+            instance: None,
+        };
+        assert_eq!(
+            selection_after_install(Some(n20), Some(n20), n18, &before, &now, by_hand),
+            Some(false)
+        );
+        // A launcher without a selection takes what an instance installed, as before.
+        assert_eq!(
+            selection_after_install(None, None, n18, &[], &list(&[n18]), pinned(false)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_selection_set_on_the_command_line_during_a_download_stays() {
+        let (n17, n18, n19) = (
+            "nightly-2026-11-17-1234567",
+            "nightly-2026-11-18-dd67b76",
+            "nightly-2026-11-19-f00125f",
+        );
+        // The window saw a follower on n18. While n19 downloaded for a pinned instance,
+        // `settings selected-version` saved n17.
+        let window = Settings {
+            selected: Some(n18.into()),
+            following: Some(n18.into()),
+            ..Settings::default()
+        };
+        // The command saves only `selected`.
+        let mut saved = Settings::parse(&serde_json::to_string(&window).unwrap());
+        saved.selected = Some(n17.into());
+        let mut window = window;
+        window.selection_from(&saved);
+        let installed = [n19.to_string(), n18.to_string(), n17.to_string()];
+        let cause = InstallCause {
+            update: false,
+            instance: Some(true),
+        };
+        assert_eq!(
+            selection_after_install(
+                window.selected.as_deref(),
+                window.following.as_deref(),
+                n19,
+                &installed[1..],
+                &installed,
+                cause
+            ),
+            None
+        );
+        assert_eq!(window.selected.as_deref(), Some(n17));
+    }
+
+    #[test]
+    fn a_followed_build_picked_again_stays_picked() {
+        let (n18, n19, n20, n21) = (
+            "nightly-2026-11-18-dd67b76",
+            "nightly-2026-11-19-f00125f",
+            "nightly-2026-11-20-0a875da",
+            "nightly-2026-11-21-1111111",
+        );
+        // A follower on n19 picks n18, n20 arrives, then it picks n19 again, now older.
+        let mut settings = Settings {
+            selected: Some(n19.into()),
+            following: Some(n19.into()),
+            ..Settings::default()
+        };
+        settings.pick(n18.into());
+        settings.pick(n19.into());
+        let now = [n21, n20, n19, n18].map(String::from);
+        for instance in [None, Some(true)] {
+            let cause = InstallCause {
+                update: instance.is_none(),
+                instance,
+            };
+            assert_eq!(
+                selection_after_install(
+                    settings.selected.as_deref(),
+                    settings.following.as_deref(),
+                    n21,
+                    &now[1..],
+                    &now,
+                    cause
+                ),
+                None,
+                "{cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_follower_on_the_newest_follows_an_instance_install() {
+        let (n19, n20) = ("nightly-2026-11-19-f00125f", "nightly-2026-11-20-0a875da");
+        let n18 = "nightly-2026-11-18-dd67b76";
+        // A settings file from before `following`, on the newest installed Nightly.
+        let legacy = format!(r#"{{"selected": "{n19}"}}"#);
+        let mut settings = Settings::parse(&legacy);
+        settings.adopt_legacy_selection(&[n19.into(), n18.into()]);
+        assert_eq!(settings.following.as_deref(), Some(n19));
+        // n20 installed for a pinned instance before the next update: the selection follows.
+        let now = [n20, n19, n18].map(String::from);
+        let pinned = InstallCause {
+            update: false,
+            instance: Some(true),
+        };
+        let after = |s: &Settings| {
+            selection_after_install(
+                s.selected.as_deref(),
+                s.following.as_deref(),
+                n20,
+                &now[1..],
+                &now,
+                pinned,
+            )
+        };
+        assert_eq!(after(&settings), Some(true));
+        // On an older one, it stays a pick.
+        let mut older = Settings::parse(&format!(r#"{{"selected": "{n18}"}}"#));
+        older.adopt_legacy_selection(&[n19.into(), n18.into()]);
+        assert_eq!(older.following, None);
+        assert_eq!(after(&older), None);
+        // Once saved, a pick reads back as a pick, not as a file from before `following`.
+        let mut picked = Settings::default();
+        picked.pick(n19.into());
+        let text = serde_json::to_string(&picked).unwrap();
+        assert!(text.contains(r#""following":null"#), "{text}");
+    }
+
+    #[test]
+    fn a_legacy_selection_is_judged_at_install_completion_against_the_list_before_it() {
+        let (n18, n19, n20) = (
+            "nightly-2026-11-18-dd67b76",
+            "nightly-2026-11-19-f00125f",
+            "nightly-2026-11-20-0a875da",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let before = [n19, n18].map(String::from);
+        let now = [n20, n19, n18].map(String::from);
+        let stable = InstallCause {
+            update: false,
+            instance: Some(false),
+        };
+        // A file from before `following` on f00125f, the newest; Home's Stable update installs
+        // 0a875da and its completion reads the file. The selection stays and follows, and the
+        // completion's save writes that.
+        fs::write(&file, format!(r#"{{"selected": "{n19}"}}"#)).unwrap();
+        let mut settings = Settings::load_for_install_from(&file, &before);
+        assert!(!settings.apply_install(n20, &before, &now, stable));
+        assert_eq!(settings.selected.as_deref(), Some(n19));
+        assert_eq!(settings.following.as_deref(), Some(n19));
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(
+            saved.contains(&format!(r#""following":"{n19}""#)),
+            "{saved}"
+        );
+        // The next update moves it on.
+        let next = "nightly-2026-11-21-1111111";
+        let later = [next, n20, n19, n18].map(String::from);
+        let update = InstallCause {
+            update: true,
+            instance: None,
+        };
+        let mut reloaded = Settings::parse(&saved);
+        assert!(reloaded.apply_install(next, &now, &later, update));
+        assert_eq!(reloaded.following.as_deref(), Some(next));
+        // A legacy pick of an older build stays a pick through the same completion.
+        fs::write(&file, format!(r#"{{"selected": "{n18}"}}"#)).unwrap();
+        let mut picked = Settings::load_for_install_from(&file, &before);
+        assert!(!picked.apply_install(n20, &before, &now, stable));
+        assert_eq!(
+            (picked.selected.as_deref(), picked.following.as_deref()),
+            (Some(n18), None)
+        );
+        assert!(serde_json::to_string(&picked)
+            .unwrap()
+            .contains(r#""following":null"#));
+    }
+
+    #[test]
+    fn loading_a_legacy_settings_file_never_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let text = r#"{"selected": "nightly-2026-11-19-f00125f", "a_newer_key": 1}"#;
+        fs::write(&file, text).unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let _ = Settings::load_from(&file);
+        let _ = Settings::load_for_install_from(&file, &[]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_removed_selection_moves_to_the_newest_left_which_follows() {
+        let left = ["v0.2.49".to_string(), "v0.2.48".to_string()];
+        let mut kept = Settings::default();
+        kept.pick("v0.2.48".into());
+        kept.keep_installed_selection(&left);
+        assert_eq!(
+            (kept.selected.as_deref(), kept.following.as_deref()),
+            (Some("v0.2.48"), None)
+        );
+        let mut gone = Settings::default();
+        gone.pick("v0.2.47".into());
+        gone.keep_installed_selection(&left);
+        assert_eq!(
+            (gone.selected.as_deref(), gone.following.as_deref()),
+            (Some("v0.2.49"), Some("v0.2.49"))
+        );
+        let mut none = Settings::default();
+        none.keep_installed_selection(&left);
+        assert_eq!(none.selected.as_deref(), Some("v0.2.49"));
+        let mut empty = Settings::default();
+        empty.pick("v0.2.47".into());
+        empty.keep_installed_selection(&[]);
+        assert_eq!((empty.selected, empty.following), (None, None));
+    }
+
+    #[test]
+    fn nightlies_of_one_day_are_ordered_by_when_they_came_out() {
+        let (a, b, c) = (
+            "nightly-2026-11-19-5ef7734",
+            "nightly-2026-11-19-f00125f",
+            "nightly-2026-11-20-0a875da",
+        );
+        let published = |t: &str| {
+            match t {
+                "nightly-2026-11-19-5ef7734" => Some("2026-11-20 02:32"),
+                "nightly-2026-11-19-f00125f" => Some("2026-11-19 15:33"),
+                "nightly-2026-11-20-0a875da" => Some("2026-11-20 11:18"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        for listing in [[a, b, c], [b, a, c], [c, b, a]] {
+            let mut tags: Vec<String> = listing.iter().map(|t| t.to_string()).collect();
+            assert!(newest_first(&mut tags, published));
+            assert_eq!(tags, [c, a, b]);
+        }
+        // Not known yet: still one order whatever the folder listing, and said so.
+        for listing in [[a, b], [b, a]] {
+            let mut tags: Vec<String> = listing.iter().map(|t| t.to_string()).collect();
+            assert!(!newest_first(&mut tags, |_| None));
+            assert_eq!(tags, [b, a]);
+        }
+    }
+
+    #[test]
+    fn a_nightly_reads_when_it_came_out_from_the_release_list() {
+        let list = serde_json::json!([{
+            "tag_name": "nightly-2026-11-19",
+            "name": "Nightly 2026-11-19 · 5ef7734",
+            "published_at": "2026-11-20T02:32:23Z",
+            "prerelease": true,
+            "assets": [],
+        }]);
+        let r = &parse_releases(&list, None, |_| true)[0];
+        assert_eq!((r.date.as_str(), r.time.as_str()), ("2026-11-20", "02:32"));
+        let nightly = Release {
+            nightly: Some(r.tag.clone()),
+            tag: crate::nightly::version_of(r),
+            ..r.clone()
+        };
+        assert_eq!(nightly.tag, "nightly-2026-11-19-5ef7734");
+        crate::nightly::note_published(&[nightly]);
+        assert_eq!(
+            crate::nightly::published_at("nightly-2026-11-19-5ef7734").as_deref(),
+            Some("2026-11-20 02:32")
+        );
     }
 
     /// The Nightly is the only build Horizon ships (docs/release-flow.md): every launcher takes the
@@ -7417,6 +7667,38 @@ pub fn {f}("
             Some(&placeholder[..])
         );
 
+        // Only fonts missing: should_refill_own_store is true, complete_assets_in fills only fonts.
+        lines.borrow_mut().clear();
+        release("v0.2.4", true);
+        for (name, data) in &assets {
+            let path = resources_at(&versions.join("v0.2.4"))
+                .join("assets")
+                .join(name);
+            write(path, data);
+        }
+        let font_json = resources_at(&versions.join("v0.2.4"))
+            .join("assets/minecraft/font/include/unifont.json");
+        let font_zip =
+            resources_at(&versions.join("v0.2.4")).join("assets/minecraft/font/unifont.zip");
+        let _ = fs::remove_file(&font_json);
+        let _ = fs::remove_file(&font_zip);
+        let res_v4 = resources_at(&versions.join("v0.2.4"));
+        assert_eq!(
+            prepare::missing_extras(&res_v4),
+            [("fonts", "the Unifont glyphs")]
+        );
+        assert!(should_refill_own_store(&store, &res_v4));
+        complete_assets_in(
+            &versions,
+            "v0.2.4",
+            || vec![empty.clone(), store.clone()],
+            &log,
+        );
+        assert_eq!(*lines.borrow(), ["Font assets ready: 2 files, 0.0 MB"]);
+        assert!(prepare::missing_extras(&res_v4).is_empty());
+        assert!(!should_refill_own_store(&store, &res_v4));
+        assert!(font_zip.is_file());
+
         // Not prepared, or complete: nothing to do, without even looking for a Minecraft folder.
         lines.borrow_mut().clear();
         release("v0.2.3", false);
@@ -7460,7 +7742,9 @@ pub fn {f}("
             fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
             fs::create_dir_all(app.join("Contents/Resources")).unwrap();
             let bin = app.join("Contents/MacOS/horizon-launcher");
-            fs::copy("/usr/bin/true", &bin).unwrap();
+            // This test binary, not a system one: an ad-hoc re-signed arm64e system binary is killed on
+            // GitHub's macOS 15 runners.
+            fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
             fs::write(app.join("Contents/Resources/version"), version).unwrap();
             fs::write(
@@ -7496,7 +7780,14 @@ pub fn {f}("
         assert_eq!(version, "2.0.0");
         let bin = installed.join("Contents/MacOS/horizon-launcher");
         assert!(
-            Command::new(&bin).status().unwrap().success(),
+            // Lists no test and runs none.
+            Command::new(&bin)
+                // reexec_include_ignored: skip, `--list` names no real test and runs none
+                .args(["--list", "--exact", "no test has this name"])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
             "still executable"
         );
         let valid = Command::new("codesign")
@@ -7560,6 +7851,8 @@ pub fn {f}("
         fs::write(&exe, "old").unwrap();
         // Another update swaps the file under the running launcher.
         fs::write(dir.join("other"), "other update").unwrap();
+        // Set, not left to the umask: under 0002 the write makes it 0664 (#19730).
+        fs::set_permissions(dir.join("other"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::rename(dir.join("other"), &exe).unwrap();
         fs::write(dir.join("new"), "new").unwrap();
         replace_binary(&dir.join("new"), &exe).unwrap();
@@ -7745,6 +8038,88 @@ pub fn {f}("
             envs.get(OsStr::new("PIPEWIRE_PROPS")),
             Some(&Some(OsStr::new("kept")))
         );
+    }
+
+    /// A player deleted a version's folder while the window was open: Prepare and Play refuse
+    /// with one sentence, never the folder's OS error, and the window's list and selection are
+    /// read again from the disk.
+    #[test]
+    fn a_version_deleted_while_the_window_is_open_is_refused_and_the_list_refreshed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let versions = scratch.path().join("versions");
+        for tag in ["scratch-a", "scratch-b"] {
+            fs::create_dir_all(versions.join(tag)).unwrap();
+            fs::write(versions.join(tag).join(COMPLETE), b"").unwrap();
+        }
+        let mut settings = Settings {
+            selected: Some("scratch-a".into()),
+            ..Settings::default()
+        };
+        assert_eq!(gone_from(&versions, &["scratch-a"]), None);
+
+        fs::remove_dir_all(versions.join("scratch-a")).unwrap();
+        let (gone, installed) = gone_from(&versions, &["scratch-a", "scratch-b"]).unwrap();
+        assert_eq!(gone, "scratch-a");
+        assert_eq!(installed, ["scratch-b"]);
+        settings.keep_installed_selection(&installed);
+        assert_eq!(settings.selected.as_deref(), Some("scratch-b"));
+
+        // Back before Reinstall was pressed (another process replacing it): the list again.
+        assert_eq!(installed_again_in(&versions, "scratch-a"), None);
+        fs::create_dir_all(versions.join("scratch-a")).unwrap();
+        fs::write(versions.join("scratch-a").join(COMPLETE), b"").unwrap();
+        let mut again = installed_again_in(&versions, "scratch-a").unwrap();
+        again.sort();
+        assert_eq!(again, ["scratch-a", "scratch-b"]);
+
+        // The whole `versions` folder gone: nothing left to select.
+        fs::remove_dir_all(&versions).unwrap();
+        let (gone, installed) = gone_from(&versions, &["scratch-b"]).unwrap();
+        assert_eq!((gone.as_str(), installed.len()), ("scratch-b", 0));
+
+        // Prepare itself, for a version not on the disk (the command line, or a delete while
+        // the window's check was already past): the sentence, not `canonicalize`'s error.
+        let error = preparer(
+            "deleted-scratch-version",
+            scratch.path(),
+            MinecraftFrom::Install,
+            &|_| {},
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error,
+            "deleted-scratch-version is no longer on this computer."
+        );
+    }
+
+    /// The only folders with the game lack one of its libraries and the download from Mojang
+    /// failed: one sentence naming the library, and the window offers the download again.
+    #[test]
+    fn incomplete_minecraft_files_name_the_library_and_offer_the_download() {
+        let download = "\n  • Downloading 26.3 from Mojang needs your Microsoft account";
+        let chosen = Path::new("chosen");
+        let checked = vec![(chosen.to_path_buf(), "no Minecraft 26.3 client jar".into())];
+        let error = incomplete_or_not_found(
+            "26.3",
+            &checked,
+            chosen,
+            Some("azure-json-1.4.0.jar".into()),
+            download,
+        );
+        assert_eq!(
+            error,
+            "Your Minecraft 26.3 files are incomplete (azure-json-1.4.0.jar is missing). \
+             Downloading 26.3 from Mojang needs your Microsoft account"
+        );
+        assert!(prepare_offers_mojang());
+        // Nothing found at all: every folder looked in, as before.
+        let error = incomplete_or_not_found("26.3", &checked, chosen, None, download);
+        assert!(
+            error.starts_with("Minecraft 26.3 was not found."),
+            "{error}"
+        );
+        assert!(error.ends_with(download), "{error}");
     }
 }
 
