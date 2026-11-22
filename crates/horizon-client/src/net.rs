@@ -2669,6 +2669,14 @@ mod tests {
                 assert_eq!(
                     cfg::Serverbound::decode(id, &body).unwrap(),
                     cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                        channel: crate::build_mismatch::CHANNEL.into(),
+                        data: crate::build_mismatch::encode(&crate::build_mismatch::this_build()),
+                    })
+                );
+                let (id, body) = server.recv().unwrap();
+                assert_eq!(
+                    cfg::Serverbound::decode(id, &body).unwrap(),
+                    cfg::Serverbound::CustomPayload(cfg::CustomPayload {
                         channel: CHANNEL.into(),
                         data: Control::Query.encode().unwrap(),
                     })
