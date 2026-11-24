@@ -130,7 +130,18 @@ pub fn component_value(tag: &horizon_core::nbt::Tag) -> crate::server::json::Jso
         Tag::Byte(b) => Json::Bool(*b != 0),
         Tag::Int(i) => Json::Number(i.to_string()),
         Tag::Long(i) => Json::Number(i.to_string()),
+        Tag::Short(i) => Json::Number(i.to_string()),
+        Tag::Float(bits) => finite_number(f64::from(f32::from_bits(*bits))),
+        Tag::Double(bits) => finite_number(f64::from_bits(*bits)),
         _ => Json::Null,
+    }
+}
+fn finite_number(value: f64) -> crate::server::json::Json {
+    use crate::server::json::Json;
+    if value.is_finite() {
+        Json::Number(value.to_string())
+    } else {
+        Json::Null
     }
 }
 
@@ -2369,6 +2380,22 @@ impl io_pool::Session for PlayConn {
         if self.payload_transport.closed() {
             return Verdict::Go;
         }
+        if id == crate::net::EXPORT_FENCE
+            && matches!(
+                self.payload_sender.framing,
+                horizon_protocol::connection::Framing::Memory
+            )
+            && self.is_owner()
+            && payload.len() == size_of::<u64>()
+        {
+            // All earlier packets on this connection have entered the server
+            // ingress queue before the client can receive this echo.
+            let mut body = horizon_protocol::buf::Writer::new();
+            body.varint(id);
+            body.bytes(&payload);
+            self.payload_sender.send(body.data);
+            return Verdict::Go;
+        }
         // Only the ids the protocol has: a client sending others (up to 2^31 of them) must not grow the
         // connection's table, so all of those are counted under one id, -1.
         self.packet_counts.add(
@@ -2722,11 +2749,24 @@ pub(super) fn frame_body(
     body: &[u8],
     out: &mut Vec<u8>,
 ) -> horizon_protocol::Result<()> {
-    // Renumbered first for a client of an older release; one with no such packet gets nothing.
-    let Some(body) = writer.for_client(body)? else {
-        return Ok(());
-    };
-    let body = &body[..];
+    // Renumbered first for a client of an older release; one with no such packet gets nothing, and what a packet
+    // brought with it (a boat's wood, an experience orb's value) follows it.
+    // A client of this release takes the body as it is: no allocation per packet.
+    if !writer.serves_older_client() {
+        return frame_one(writer, body, out);
+    }
+    for body in writer.for_client(body)? {
+        frame_one(writer, &body, out)?;
+    }
+    Ok(())
+}
+
+/// One packet body, already in the client's numbering, framed into `out`.
+fn frame_one(
+    writer: &mut ConnWriter,
+    body: &[u8],
+    out: &mut Vec<u8>,
+) -> horizon_protocol::Result<()> {
     match writer.framing() {
         horizon_protocol::connection::Framing::Network(Some(t))
             if body.len() >= t.max(SHARED_FRAME_MIN) =>
@@ -2759,6 +2799,22 @@ impl KeepAliveWatch {
 #[cfg(test)]
 mod tests {
     include!("profession_join_tests.rs");
+
+    /// A float, double or short in a component (a translate `with` argument) is a JSON number.
+    #[test]
+    fn component_json_keeps_numeric_arguments() {
+        use horizon_core::nbt::Tag;
+        let with = Tag::List(vec![
+            Tag::Float(2.5f32.to_bits()),
+            Tag::Double(1.0f64.to_bits()),
+            Tag::Short(7),
+        ]);
+        let tag = Tag::compound([("translate", Tag::String("k".into())), ("with", with)]);
+        assert_eq!(
+            component_json(&tag),
+            r#"{"translate":"k","with":[2.5,1,7]}"#
+        );
+    }
 
     /// Bodies shared between players reach each of them as the same bytes, in the order
     /// they were sent among the player's own.

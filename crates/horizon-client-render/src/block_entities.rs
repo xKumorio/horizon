@@ -36,6 +36,21 @@ mod carry;
 pub use carry::Carried;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_SIGN_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_sign_revision() -> u64 {
+    NEXT_SIGN_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Monotonic sign-data revision owned by a [`BlockEntities`] store.
+/// Uses a process-wide counter so distinct worlds and dimension switches never collide.
+struct SignRevision(u64);
+
+impl Default for SignRevision {
+    fn default() -> Self {
+        Self(next_sign_revision())
+    }
+}
 
 fn next_token() -> u64 {
     let mut token = NEXT_TOKEN.load(Ordering::Relaxed);
@@ -161,6 +176,8 @@ pub struct BlockEntities {
     /// The API snapshots a client's mod block entities are ticked with
     /// (`take_client_snapshots`), by position.
     client_snapshots: FxHashMap<Pos, ClientSnapshot>,
+    /// Bumped whenever any [`BlockEntity::Sign`] in `map` may have changed.
+    sign_revision: SignRevision,
 }
 
 /// A removed block entity held for the `block_drops` event of its break: its position, the
@@ -760,6 +777,14 @@ impl BlockEntities {
             _ => None,
         }
     }
+    /// Revision bumped whenever any [`BlockEntity::Sign`] in this store may have changed.
+    pub fn sign_revision(&self) -> u64 {
+        self.sign_revision.0
+    }
+    #[inline]
+    fn bump_sign_revision(&mut self) {
+        self.sign_revision.0 = next_sign_revision();
+    }
     /// `SignBlockEntity.setAllowedPlayerEditor`: the one player whose editor
     /// is on the sign at `pos`, or `None` for nobody's.
     pub fn set_sign_editor(&mut self, pos: Pos, who: Option<u128>) {
@@ -767,6 +792,7 @@ impl BlockEntities {
             return;
         };
         sign.allowed_editor = who;
+        self.sign_revision.0 = next_sign_revision();
         if who.is_some() {
             self.sign_editors.insert(pos);
         } else {
@@ -797,14 +823,20 @@ impl BlockEntities {
     }
     pub fn get_mut(&mut self, pos: &Pos) -> Option<&mut BlockEntity> {
         self.wake(pos);
-        self.map.get_mut(pos)
+        let entity = self.map.get_mut(pos)?;
+        if matches!(entity, BlockEntity::Sign(_)) {
+            self.sign_revision.0 = next_sign_revision();
+        }
+        Some(entity)
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&Pos, &mut BlockEntity)> {
         self.wake_all();
+        self.bump_sign_revision();
         self.map.iter_mut()
     }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut BlockEntity> {
         self.wake_all();
+        self.bump_sign_revision();
         self.map.values_mut()
     }
     pub fn sleep(&mut self, pos: Pos) {
@@ -840,6 +872,7 @@ impl BlockEntities {
         replace_identity: bool,
     ) -> Option<BlockEntity> {
         let new_is_mod = matches!(entity, BlockEntity::Mod(_));
+        let new_is_sign = matches!(entity, BlockEntity::Sign(_));
         let same_type = |old: &BlockEntity| match (old, &entity) {
             (BlockEntity::Mod(old), BlockEntity::Mod(new)) => old.id() == new.id(),
             (old, new) => std::mem::discriminant(old) == std::mem::discriminant(new),
@@ -856,6 +889,9 @@ impl BlockEntities {
         self.wake(&pos);
         index_chunk(&mut self.by_chunk, pos);
         let old = self.map.insert(pos, entity);
+        if new_is_sign || matches!(old, Some(BlockEntity::Sign(_))) {
+            self.bump_sign_revision();
+        }
         if self.on_load_enabled && new_identity && new_is_mod {
             self.on_load.push_back((pos, self.generations[&pos]));
         }
@@ -904,6 +940,9 @@ impl BlockEntities {
         if absent {
             note_listed(&mut self.listed, pos, Some(entity));
         }
+        if matches!(entity, BlockEntity::Sign(_)) {
+            self.sign_revision.0 = next_sign_revision();
+        }
         entity
     }
     /// Keep `data`, the saved data (with its `CustomName`) of the block entity just removed from
@@ -945,6 +984,9 @@ impl BlockEntities {
         self.wake(pos);
         self.cancel(pos);
         let removed = self.map.remove(pos);
+        if matches!(removed, Some(BlockEntity::Sign(_))) {
+            self.bump_sign_revision();
+        }
         unindex_chunk(&mut self.by_chunk, pos);
         forget_mod(&mut self.mods, *pos);
         self.boxes.remove(pos);
@@ -957,6 +999,9 @@ impl BlockEntities {
     pub fn take(&mut self, pos: &Pos) -> Option<(BlockEntityLease, BlockEntity)> {
         self.wake(pos);
         let entity = self.map.remove(pos)?;
+        if matches!(entity, BlockEntity::Sign(_)) {
+            self.bump_sign_revision();
+        }
         unindex_chunk(&mut self.by_chunk, pos);
         let token = next_token();
         self.out.insert(*pos, token);
@@ -999,11 +1044,13 @@ impl BlockEntities {
         self.note_box(pos, Some(&entity));
         note_listed(&mut self.listed, pos, Some(&entity));
         self.note_sign_editor(pos, &entity);
+        let is_sign = matches!(entity, BlockEntity::Sign(_));
         index_chunk(&mut self.by_chunk, pos);
-        if self.map.insert(pos, entity).is_none()
-            && !self.live.contains_key(&pos)
-            && !self.pending.contains_key(&pos)
-        {
+        let old = self.map.insert(pos, entity);
+        if is_sign || matches!(old, Some(BlockEntity::Sign(_))) {
+            self.bump_sign_revision();
+        }
+        if old.is_none() && !self.live.contains_key(&pos) && !self.pending.contains_key(&pos) {
             self.add(pos);
         }
         true
@@ -1026,7 +1073,7 @@ impl BlockEntities {
     pub fn unload(&mut self, mut gone: impl FnMut(&Pos) -> bool) {
         self.carried.retain(|p, _| !gone(p));
         let asleep = std::mem::take(&mut self.asleep);
-        self.retain(|p, _| !gone(p));
+        self.retain_impl(|p, _| !gone(p), false);
         self.retire_taken(gone);
         self.asleep = asleep;
         let map = &self.map;
@@ -1035,7 +1082,14 @@ impl BlockEntities {
     }
     /// Removes the block entities `keep` refuses, and their slots
     /// (`clearAllBlockEntities` of unloaded chunks).
-    pub fn retain(&mut self, mut keep: impl FnMut(&Pos, &mut BlockEntity) -> bool) {
+    pub fn retain(&mut self, keep: impl FnMut(&Pos, &mut BlockEntity) -> bool) {
+        self.retain_impl(keep, true);
+    }
+    fn retain_impl(
+        &mut self,
+        mut keep: impl FnMut(&Pos, &mut BlockEntity) -> bool,
+        may_mutate_kept: bool,
+    ) {
         self.wake_all();
         let (live, pending, freed, attachments) = (
             &mut self.live,
@@ -1048,8 +1102,13 @@ impl BlockEntities {
         let generations = &mut self.generations;
         let observer = self.attachment_observer.as_ref();
         let sign_editors = &mut self.sign_editors;
+        let mut sign_changed = false;
         self.map.retain(|p, e| {
+            let was_sign = matches!(e, BlockEntity::Sign(_));
             let kept = keep(p, e);
+            if was_sign && (!kept || may_mutate_kept) {
+                sign_changed = true;
+            }
             if !kept {
                 retire_attachments(attachments, observer, generations, p);
                 generations.remove(p);
@@ -1060,9 +1119,14 @@ impl BlockEntities {
                 forget_listed(listed, p);
                 unindex_chunk(by_chunk, p);
                 sign_editors.remove(p);
+            } else if matches!(e, BlockEntity::Sign(_)) && may_mutate_kept {
+                sign_changed = true;
             }
             kept
         });
+        if sign_changed {
+            self.bump_sign_revision();
+        }
     }
     /// [`Self::unload`] of the block entities in `chunks`, reading theirs alone ([`Self::by_chunk`])
     /// rather than every block entity of the world. The same block entities go, with the same of
@@ -1077,10 +1141,12 @@ impl BlockEntities {
             .flatten()
             .copied()
             .collect();
+        let mut removed_sign = false;
         for p in &positions {
-            if self.map.remove(p).is_none() {
+            let Some(removed) = self.map.remove(p) else {
                 continue;
-            }
+            };
+            removed_sign |= matches!(removed, BlockEntity::Sign(_));
             retire_attachments(
                 &mut self.attachments,
                 self.attachment_observer.as_ref(),
@@ -1096,6 +1162,9 @@ impl BlockEntities {
             unindex_chunk(&mut self.by_chunk, p);
             self.sign_editors.remove(p);
             self.wake(p);
+        }
+        if removed_sign {
+            self.bump_sign_revision();
         }
         self.retire_taken(gone);
     }
@@ -1124,6 +1193,7 @@ impl BlockEntities {
         self.carried.clear();
         self.client_snapshots.clear();
         self.freed = false;
+        self.bump_sign_revision();
     }
     /// A loaded or generated chunk's block entities, in the order the chunk
     /// lists them; they tick in its block entity map's order
@@ -1132,6 +1202,7 @@ impl BlockEntities {
     /// its slot is decided by the block state at the next tick.
     pub fn load_chunk(&mut self, entities: Vec<(Pos, BlockEntity)>) {
         let order = chunk_map_order(entities.iter().map(|(p, _)| *p));
+        let mut touched_sign = false;
         for (p, e) in entities {
             self.replace_taken(p);
             retire_attachments(
@@ -1143,11 +1214,13 @@ impl BlockEntities {
             self.new_generation(p);
             self.wake(&p);
             let new_is_mod = matches!(e, BlockEntity::Mod(_));
+            let new_is_sign = matches!(e, BlockEntity::Sign(_));
             self.note_box(p, Some(&e));
             note_listed(&mut self.listed, p, Some(&e));
             self.note_sign_editor(p, &e);
             index_chunk(&mut self.by_chunk, p);
             let old = self.map.insert(p, e);
+            touched_sign |= new_is_sign || matches!(old, Some(BlockEntity::Sign(_)));
             if old.is_some() {
                 self.replaced.insert(p);
             }
@@ -1156,6 +1229,9 @@ impl BlockEntities {
             } else {
                 forget_mod(&mut self.mods, p);
             }
+        }
+        if touched_sign {
+            self.bump_sign_revision();
         }
         for p in order {
             if self.on_load_enabled && matches!(self.map.get(&p), Some(BlockEntity::Mod(_))) {
