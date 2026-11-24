@@ -1344,6 +1344,12 @@ impl BlockEntities {
         let _ = self.tickers(state);
         self.awake_ticker_slots()
     }
+    /// The index in [`Self::ticker_slots`] of the first ticker promoted after the one of `order`
+    /// (an order from [`Self::awake_ticker_slots`]): where a pass resumes once a wake has made
+    /// its awake list stale. Slot ids wrap; orders don't.
+    pub fn ticker_index_after(&self, order: u64) -> usize {
+        self.ticker_orders.partition_point(|&o| o <= order)
+    }
     /// The ticker list as it stands, without promoting pending slots.
     pub fn ticker_slots(&self) -> Arc<Vec<(Pos, u32)>> {
         Arc::clone(&self.tickers)
@@ -1632,13 +1638,10 @@ mod tests {
 
         // Waking p2 (slot 1 < prev slot u32::MAX) must still resume after p0 via insertion order.
         let _ = b.get_mut(&p2);
-        let resumed = b.awake_ticker_slots();
-        let idx = resumed.partition_point(|&(_, _, order)| order <= prev_order);
+        let all = b.ticker_slots();
+        let idx = b.ticker_index_after(prev_order);
         assert_eq!(
-            resumed[idx..]
-                .iter()
-                .map(|(p, _, _)| *p)
-                .collect::<Vec<_>>(),
+            all[idx..].iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             [p1, p2]
         );
     }

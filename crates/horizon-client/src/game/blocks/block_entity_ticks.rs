@@ -346,26 +346,38 @@ impl Game<'_> {
         this.trial_spawner_tick_positions.clear();
         this.item_columns = Some(Default::default());
         this.pass_mobs = Some(Default::default());
-        let mut tickers = this.world.awake_block_entity_tickers();
-        let mut wake_epoch = this.world.block_entities.wake_epoch();
+        let awake = this.world.awake_block_entity_tickers();
+        let wake_epoch = this.world.block_entities.wake_epoch();
+        // Once something wakes mid-pass, the rest of the pass walks the full ticker list from
+        // where it got to, skipping sleepers below: one switch, not a rebuild per wake.
+        let mut all: Option<std::sync::Arc<Vec<(Pos, u32)>>> = None;
         let mut last_chunk = (i32::MIN, i32::MIN);
         let mut last_chunk_ticking = false;
         let mut idx = 0usize;
         let mut last_order: Option<u64> = None;
         loop {
-            if let Some(prev) = last_order
-                && this.world.block_entities.wake_epoch() != wake_epoch
-            {
-                tickers = this.world.block_entities.awake_ticker_slots();
-                wake_epoch = this.world.block_entities.wake_epoch();
-                idx = tickers.partition_point(|&(_, _, order)| order <= prev);
-            }
-            let Some(&(pos, ticker_slot, order)) = tickers.get(idx) else {
-                break;
+            let ticker = if let Some(all) = &all {
+                let Some(&ticker) = all.get(idx) else {
+                    break;
+                };
+                idx += 1;
+                ticker
+            } else {
+                if let Some(prev) = last_order
+                    && this.world.block_entities.wake_epoch() != wake_epoch
+                {
+                    all = Some(this.world.block_entities.ticker_slots());
+                    idx = this.world.block_entities.ticker_index_after(prev);
+                    continue;
+                }
+                let Some(&(pos, ticker_slot, order)) = awake.get(idx) else {
+                    break;
+                };
+                idx += 1;
+                last_order = Some(order);
+                (pos, ticker_slot)
             };
-            idx += 1;
-            last_order = Some(order);
-            let ticker = (pos, ticker_slot);
+            let pos = ticker.0;
             let chunk = (pos.0 >> 4, pos.2 >> 4);
             let chunk_ticking = if chunk == last_chunk {
                 last_chunk_ticking
