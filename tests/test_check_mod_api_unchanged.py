@@ -286,6 +286,27 @@ class CompareTests(unittest.TestCase):
         status, text = self.run_compare(base, {**head, "hook-notes.md": NOTES + "\n## Added\n\nNew.\n"},
                                         allow_added=True)
         self.assertEqual(status, 0, text)
+
+    def test_scoped_part_hook_addition_preserves_existing_guest_dispatch(self):
+        old_hook = {"name": "existing", "neoforge": "existing event"}
+        new_hook = {"name": "can_place_item", "scope": "block_entity", "neoforge": "none"}
+        old_arm = ('12 => { let receiver = super::hooks(); let p = crate::__wire_record_52(value);\n'
+                   ' let answer = receiver.existing(&p); out.put_owned(answer); }\n')
+        new_arm = ('27 => { let receiver = crate::wire::guest::handler::<dyn crate :: BlockEntityPart>(input.take()?)?;'
+                   ' let p = crate::__wire_record_52(value);\n'
+                   ' let answer = receiver.can_place_item(&mut p); out.put_owned(answer); }\n')
+        old_name = 'crate::HookId::Existing => "existing",'
+        new_name = 'crate::HookId::CanPlaceItem => "can_place_item",'
+        fallback = '_ => return Err(crate::wire::WireError::Tag(id)) }\n'
+        base = {"catalog.json": json.dumps({"hooks": [old_hook]}), "hook-notes.md": NOTES,
+                "wire_guest_generated.rs": old_name + "\n" + old_arm + fallback}
+        head = {"catalog.json": json.dumps({"hooks": [new_hook, old_hook]}), "hook-notes.md": NOTES,
+                "wire_guest_generated.rs": new_name + old_name + "\n" + new_arm
+                + old_arm.replace("_52", "_53") + fallback}
+        for allowed in (True, False):
+            with self.subTest(allow_added=allowed):
+                status, text = self.run_compare(base, head, allow_added=allowed)
+                self.assertEqual(status, 0 if allowed else 1, text)
         # An added hook explains new note sections, not an edit to an existing hook's or the general notes.
         for notes in (NOTES.replace("Old.", "Edited.") + "\n## Added\n", NOTES.replace("General.", "Edited.")
                       + "\n## Added\n", "# Hook notes\n\n## Added\n"):
@@ -367,6 +388,18 @@ class CompareTests(unittest.TestCase):
         # can't be told from a later hook losing an owned type, so this fails rather than open that.
         self.assertEqual(self.compare_hook_addition((857, 860, 863, 862), self.OWNED_ARM), 1)
 
+    def test_an_added_hook_and_a_new_host_area_with_its_own_records_pass(self):
+        # The three retained records above the new host import shift even before the hook.
+        records = (859, 861, 865, 864)
+        source = ('impl crate::VideoClientHost for Guest {\n'
+                  'fn start(&mut self) -> u32 { let r = host_import!("Video::start#ab", 5u32, w); r.take() }\n'
+                  '}\n')
+        self.assertEqual(self.compare_hook_addition(records, self.OWNED_ARM, lambda text: source + text), 0)
+        unsupported = source.replace('}\n', 'fn unexpected(&self) {}\n}\n', 1)
+        self.assertEqual(self.compare_hook_addition(records, self.OWNED_ARM, lambda text: unsupported + text), 1)
+        self.assertEqual(self.compare_hook_addition((859, 861, 864, 865), self.OWNED_ARM,
+                                                    lambda text: source + text), 1)
+
     def test_a_changed_existing_arm_beside_an_added_hook_fails(self):
         cases = {
             "an existing arm's text": ((857, 859, 863, 862), lambda text: text.replace("out.put(&p1.visible);", "")),
@@ -379,6 +412,87 @@ class CompareTests(unittest.TestCase):
             for arm in (self.OWNED_ARM, self.BORROWED_ARM):
                 with self.subTest(name, borrowed=arm is self.BORROWED_ARM):
                     self.assertEqual(self.compare_hook_addition(records, arm, edit), 1)
+
+    @staticmethod
+    def forwarders(calls, records=(40, 41)):
+        """A guest wire's `Guest` impl with one forwarder per (name, number) call, then a hook arm naming two records."""
+        first, second = records
+        lines = [f'fn {name.split("#")[0].split("::")[1]}(&self) -> u32 {{ let mut w = crate::wire::guest::begin(); '
+                 f'let r = host_import!("{name}", {number}u32, w); r.take().expect("wrong type") }}\n'
+                 for name, number in calls]
+        return ("impl mod_api::prelude::PlayersServerHost for Guest {\n" + "".join(lines) + "}\n"
+                "pub fn hook(id: u32, input: &mut crate::wire::Reader<'_>, out: &mut crate::wire::Writer) {\nmatch id {\n"
+                f"7 => {{ let receiver = super::hooks(); let p = crate::__wire_record_{first}(input.take()?);\n"
+                f" let q = mod_api::__wire_record_{second}(&p); let answer = receiver.existing(&host, &q); }}\n"
+                "_ => return Err(crate::wire::WireError::Tag(id)) }\n}\n")
+
+    BASE_CALLS = [("Players::online#aa", 1091), ("Players::kick#bb", 1092), ("Chunk::forced#cc", 1100)]
+
+    def compare_call_addition(self, head_calls, records=(40, 41), allow_added=True):
+        base = {"catalog.json": json.dumps({"hooks": [{"name": "existing"}]}),
+                "wire_guest_generated.rs": self.forwarders(self.BASE_CALLS)}
+        head = {"catalog.json": base["catalog.json"], "wire_guest_generated.rs": self.forwarders(head_calls, records)}
+        return self.run_compare(base, head, allow_added=allow_added)
+
+    def test_an_added_host_call_passes_with_the_flag_only(self):
+        # The new call takes position 1092, so the later imports, held ones too, move up by one.
+        head = [("Players::online#aa", 1091), ("Players::raw#dd", 1092), ("Players::kick#bb", 1093),
+                ("Chunk::forced#cc", 1101)]
+        status, text = self.compare_call_addition(head)
+        self.assertEqual(status, 0, text)
+        self.assertIn("Host calls added (accepted): Players::raw#dd", text)
+        self.assertEqual(self.compare_call_addition(head, allow_added=False)[0], 1)
+        with self.subTest("a type the call brings in moves the later records"):
+            self.assertEqual(self.compare_call_addition(head, records=(40, 43))[0], 0)
+            self.assertEqual(self.compare_call_addition(head, records=(42, 43))[0], 0)
+
+    def test_a_changed_or_removed_host_call_beside_an_added_one_fails(self):
+        added = ("Players::raw#dd", 1092)
+        cases = {
+            "a changed signature": [("Players::online#ee", 1091), added, ("Players::kick#bb", 1093),
+                                    ("Chunk::forced#cc", 1101)],
+            "a removed call": [("Players::online#aa", 1091), added, ("Chunk::forced#cc", 1100)],
+        }
+        for name, calls in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.compare_call_addition(calls)[0], 1)
+        with self.subTest("two retained records swapped"):
+            calls = [("Players::online#aa", 1091), added, ("Players::kick#bb", 1093), ("Chunk::forced#cc", 1101)]
+            self.assertEqual(self.compare_call_addition(calls, records=(43, 42))[0], 1)
+
+    def test_an_added_host_call_does_not_explain_other_edits(self):
+        base_calls = self.BASE_CALLS
+        head = self.forwarders([("Players::online#aa", 1091), ("Players::raw#dd", 1092), ("Players::kick#bb", 1093),
+                                ("Chunk::forced#cc", 1101)])
+        base = {"wire_guest_generated.rs": self.forwarders(base_calls), "hook-notes.md": NOTES}
+        for name, files in {
+            "an edited forwarder": {"wire_guest_generated.rs": head.replace('1093u32, w); r.take().expect("wrong type")',
+                                                                            '1093u32, w); r.take().expect("other")')},
+            "an edited hook note": {"wire_guest_generated.rs": head, "hook-notes.md": NOTES.replace("Old.", "New.")},
+        }.items():
+            with self.subTest(name):
+                status, text = self.run_compare(base, {"hook-notes.md": NOTES, **files}, allow_added=True)
+                self.assertEqual(status, 1, text)
+
+    def test_an_added_native_only_unsupported_stub_passes_with_the_flag(self):
+        stub = ('#[cfg(not(target_arch = "wasm32"))]\n'
+                'fn tool_break_block(&mut self, p0: u32) -> bool '
+                '{ crate::wire::guest::unsupported("BackendMut::tool_break_block") }\n')
+        existing_stub = ('#[cfg(not(target_arch = "wasm32"))]\n'
+                         'fn existing_native(&self) -> bool '
+                         '{ crate::wire::guest::unsupported("BackendMut::existing_native") }\n')
+        base_wire = self.forwarders(self.BASE_CALLS).replace("\n}\n", "\n" + existing_stub + "}\n", 1)
+        head_wire = base_wire.replace("\n}\n", "\n" + stub + "}\n", 1)
+        status, text = self.run_compare({"wire_guest_generated.rs": base_wire},
+                                        {"wire_guest_generated.rs": head_wire}, allow_added=True)
+        self.assertEqual(status, 0, text)
+        self.assertIn("Host calls added (accepted): BackendMut::tool_break_block", text)
+        self.assertEqual(self.run_compare({"wire_guest_generated.rs": base_wire},
+                                          {"wire_guest_generated.rs": head_wire}, allow_added=False)[0], 1)
+        # Editing an existing unsupported stub still fails.
+        edited = head_wire.replace("fn existing_native(&self) -> bool", "fn existing_native(&self) -> u32")
+        self.assertEqual(self.run_compare({"wire_guest_generated.rs": base_wire},
+                                          {"wire_guest_generated.rs": edited}, allow_added=True)[0], 1)
 
     def test_a_loops_json_difference_fails_with_the_flag(self):
         status, _ = self.run_compare({"loops.json": NO_LOOPS}, {"loops.json": json.dumps({"loops": [], "x": 1})}, allow_added=True)

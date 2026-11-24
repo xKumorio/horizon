@@ -47,6 +47,7 @@ id = "soft_light"          # [a-z0-9_]{1,64}: the settings key and the registry 
 name = "Soft Light"
 version = "1.0.0"
 api = "0.2"                # the shader API line the WGSL is written for
+post_opaque = true         # optional, let post passes read the world before translucent terrain
 description = "..."        # optional, like authors and license
 shared = ["common.wgsl"]   # optional: WGSL put before every stage's file, in order
 
@@ -56,6 +57,9 @@ clouds = true              # optional: false when the pack draws its own clouds
 sun = true                 # optional: false when the pack draws its own sun
 moon = true                # optional: false when the pack draws its own moon
 stars = true               # optional: false when the pack draws its own stars
+sun_path_rotation = 0.0    # optional: the sun's and moon's path tilted by this many degrees (-90 to 90), as
+                           # `sunPathRotation`: sun_direction, moon_direction, light_direction, the shadow
+                           # camera and Minecraft's sun, moon and stars turn with it
 
 [material]
 file = "material.wgsl"
@@ -299,6 +303,14 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
 
 ## Changelog
 
+- API 0.2 (addition): `post_opaque = true` lets native post passes read the pre-translucent
+  color and depth. They reuse the material stage's capture, and only packs that read it request
+  that capture (#3734).
+
+- 2026-11-22: API 0.2 (addition, preview): `[sky] sun_path_rotation`, degrees from -90 to 90 (0 when absent): the
+  tilt of the sun's and moon's path, as `shaders/` packs' `sunPathRotation`. It turns `sun_direction`,
+  `moon_direction`, `light_direction`, the shadow camera and the sun, moon and stars Minecraft draws over the pack's
+  sky (nothing turns under the End sky). A pack without the key is unchanged.
 - 2026-11-21: API 0.2 (additions, preview; first build: Nightly `TBD`): the candidate step, under `[ray_tracing]`
   with its second key, `step = true` (off by default). A stage whose files name `trace_step`, `RayCandidate`, a
   `candidate_` function or a `RAY_PASS`/`RAY_STOP`/`RAY_END` action defines `struct RayState` and `fn ray_step(c:

@@ -1,8 +1,13 @@
 //! One of Horizon's own shader packs while it runs (docs/shaders.md): the frame its stages
 //! read, its sky, material, entity and post stages, and the timer of their passes.
 
+use std::borrow::Cow;
+
+use glam::Mat4;
 use horizon_shader_api::check::CheckedStage;
 use horizon_shader_api::{Report, StageKind};
+
+use crate::mesher::Vertex;
 
 use super::displace::Displacement;
 use super::external::{
@@ -29,6 +34,8 @@ pub struct NativePack {
     pub vanilla_sun: bool,
     pub vanilla_moon: bool,
     pub vanilla_stars: bool,
+    /// `[sky] sun_path_rotation`, degrees: also turns the sun, moon and stars Minecraft draws.
+    pub sun_path_rotation: f32,
     pub weather: Option<wgpu::RenderPipeline>,
     /// The draw of the shadow map the stages read, if the pack asks for one.
     pub shadow: Option<NativeShadow>,
@@ -76,9 +83,8 @@ fn option_on(constants: &[(String, f64)], id: Option<&String>) -> bool {
 }
 
 /// Whether a stage of the pack reads the world before translucent terrain (`opaque_depth`,
-/// `opaque_color`): only the material stage has them, for `material` and, under
-/// `[displacement]`, `displacement`, and whatever those call.
-fn reads_opaque(stages: &[CheckedStage]) -> bool {
+/// `opaque_color`), including reads through functions called by a stage.
+fn reads_opaque(stages: &[CheckedStage], post_opaque: bool) -> bool {
     let reads = |s: &CheckedStage, function: naga::Handle<naga::Function>| {
         s.module
             .global_variables
@@ -88,12 +94,19 @@ fn reads_opaque(stages: &[CheckedStage]) -> bool {
     };
     stages
         .iter()
-        .filter(|s| s.kind == StageKind::Material)
+        .filter(|s| {
+            s.kind == StageKind::Material
+                || (post_opaque && matches!(s.kind, StageKind::Post | StageKind::Compute))
+        })
         .any(|s| {
             s.module
                 .functions
                 .iter()
-                .filter(|(_, f)| matches!(f.name.as_deref(), Some("material" | "displacement")))
+                .filter(|(_, f)| {
+                    f.name.as_deref() == Some(s.kind.function())
+                        || (s.kind == StageKind::Material
+                            && f.name.as_deref() == Some("displacement"))
+                })
                 .any(|(function, _)| reads(s, function))
         })
 }
@@ -334,6 +347,12 @@ impl NativePack {
             terrain.pbr,
             terrain.linear,
         );
+        let sun_path_rotation = report
+            .sky
+            .as_ref()
+            .and_then(|s| s.sun_path_rotation)
+            .unwrap_or(0.0);
+        frame.set_sun_path_rotation(sun_path_rotation);
         // One buffer of light sources for every stage of a `[ray_tracing] lights = true` pack
         // whose files name them, on a device that traces: the passes' bind groups take it as
         // they are made. Its sources and worker wait for a pass that reads them (below).
@@ -403,7 +422,7 @@ impl NativePack {
             .find(|s| s.kind == StageKind::Material)
             .is_some_and(|s| s.reads("reflection"))
             && option_on(constants, option);
-        frame.reads_opaque = reads_opaque(&report.stages);
+        frame.reads_opaque = reads_opaque(&report.stages, report.manifest.post_opaque);
         let fog = report.material_fog;
         let coverage = report.manifest.material_coverage;
         let keeps = |key: fn(&horizon_shader_api::Stage) -> Option<bool>| {
@@ -570,6 +589,7 @@ impl NativePack {
             vanilla_sun,
             vanilla_moon,
             vanilla_stars,
+            sun_path_rotation,
             weather,
             shadow,
             displacement,
@@ -617,7 +637,7 @@ impl NativePack {
     }
 
     /// Binds the water mirror the renderer drew this frame, and outside the title screen
-    /// fits the material stage's copies of the world and the surface target to its targets.
+    /// fits the opaque copies and the material stage's surface target to its targets.
     pub fn prepare_world_targets(&mut self, world: WorldTargets<'_>) {
         let WorldTargets {
             device,
@@ -632,8 +652,8 @@ impl NativePack {
         if title {
             return;
         }
-        if self.material.is_some() {
-            self.frame.fit_opaque(device, depth, color);
+        if self.frame.fit_opaque(device, depth, color) {
+            self.post.refresh_opaque(&self.frame);
         }
         let writes = self.material.as_ref().is_some_and(|m| m.writes_surface);
         let size = if writes {
@@ -748,9 +768,41 @@ impl NativePack {
     }
 }
 
+/// The turn a native pack's `[sky] sun_path_rotation` (`tilt`, degrees) gives the stars, sun and
+/// moon the renderer draws (none under the End sky), as `PackSky::prepare` gives them for
+/// `shaders/` packs.
+pub(super) fn sky_turn(tilt: f32, end_sky: bool) -> Mat4 {
+    super::pack_uniforms::tilt_matrix(if end_sky { 0.0 } else { tilt })
+}
+
+/// The bytes of the frame's first `count` sun and moon vertices, turned by [`sky_turn`].
+pub(super) fn celestial_bytes<'a>(
+    tilt: f32,
+    frame: &super::Frame<'a>,
+    count: usize,
+) -> Cow<'a, [u8]> {
+    turned(sky_turn(tilt, frame.end_sky), &frame.celestial[..count])
+}
+
+fn turned(turn: Mat4, bodies: &[Vertex]) -> Cow<'_, [u8]> {
+    if turn == Mat4::IDENTITY {
+        return Cow::Borrowed(bytemuck::cast_slice(bodies));
+    }
+    let bodies: Vec<Vertex> = bodies
+        .iter()
+        .map(|v| Vertex {
+            pos: turn.transform_vector3(v.pos.into()).into(),
+            ..*v
+        })
+        .collect();
+    Cow::Owned(bytemuck::cast_slice(&bodies).to_vec())
+}
+
 #[cfg(test)]
 pub(in crate::gfx) mod tests {
-    use super::{Capabilities, NativePack, TerrainShape, chosen_shadow, reads_opaque};
+    use super::{
+        Capabilities, NativePack, TerrainShape, chosen_shadow, reads_opaque, sky_turn, turned,
+    };
     use horizon_shader_api::manifest::{OptionKind, PackOption, Shadow};
 
     /// The world before translucent terrain is copied only for a pack whose material, or the
@@ -782,7 +834,10 @@ file = \"material.wgsl\"
             let files = [(MANIFEST, manifest), ("material.wgsl", text.as_str())]
                 .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
                 .into();
-            reads_opaque(&check(&Pack::from_files(files).unwrap()).unwrap().stages)
+            reads_opaque(
+                &check(&Pack::from_files(files).unwrap()).unwrap().stages,
+                false,
+            )
         };
         let plain = "return Surface(input.albedo);";
         let flat = "return 0.0;";
@@ -799,6 +854,44 @@ file = \"material.wgsl\"
             plain,
             "return textureLoad(opaque_depth, vec2<i32>(input.uv), 0);"
         ));
+        let post_reads = |body: &str| {
+            let manifest = "schema = 1\nid = \"t\"\nname = \"T\"\nversion = \"1\"\napi = \"0.2\"\n\
+                            post_opaque = true\n[[post]]\nfile = \"post.wgsl\"\n";
+            let shader = format!(
+                "fn behind() -> f32 {{ return textureLoad(opaque_depth, vec2<i32>(0), 0); }}\n\
+                 fn post(input: PostInput) -> vec4<f32> {{ {body} }}"
+            );
+            let files = [(MANIFEST, manifest), ("post.wgsl", &shader)]
+                .map(|(name, text)| (name.to_owned(), text.as_bytes().to_vec()))
+                .into();
+            reads_opaque(
+                &check(&Pack::from_files(files).unwrap()).unwrap().stages,
+                true,
+            )
+        };
+        assert!(!post_reads("return input.color;"));
+        assert!(post_reads("return vec4<f32>(behind());"));
+    }
+
+    /// Without a pack the sky is not turned and the sun and moon go up as they are; a turn
+    /// moves each vertex and keeps the rest of it.
+    #[test]
+    fn the_sun_and_moon_turn_only_with_a_tilt() {
+        use crate::mesher::Vertex;
+        use std::borrow::Cow;
+        assert_eq!(sky_turn(0.0, false), glam::Mat4::IDENTITY);
+        let mut sun = <Vertex as bytemuck::Zeroable>::zeroed();
+        sun.pos = [0.0, 1.0, 0.0];
+        sun.color = 7;
+        let bodies = [sun];
+        assert!(matches!(
+            turned(glam::Mat4::IDENTITY, &bodies),
+            Cow::Borrowed(_)
+        ));
+        let tilted = turned(super::super::pack_uniforms::tilt_matrix(90.0), &bodies);
+        let moved: Vec<Vertex> = bytemuck::pod_collect_to_vec(&tilted);
+        assert!((moved[0].pos[1]).abs() < 1e-6 && (moved[0].pos[2].abs() - 1.0).abs() < 1e-6);
+        assert_eq!(moved[0].color, 7);
     }
 
     /// A device with OpenGL's minimum 16 sampled textures per stage refuses a pack whose
@@ -1266,7 +1359,13 @@ file = \"material.wgsl\"
             Option<&'a wgpu::TextureView>,
             Option<&'a wgpu::BindGroup>,
         );
-        let draws: [Draw<'_>; 4] = [
+        // The solid terrain's depth pre-pass, which `[material] coverage = engine` has, before
+        // the solid entry that tests equal against it.
+        let depth_pass = layers
+            .depth
+            .expect("the engine's coverage has a depth pre-pass");
+        let draws: [Draw<'_>; 5] = [
+            (depth_pass.solid, Some(&color), None),
             (layers.solid, Some(&color), None),
             (layers.translucent, Some(&color), None),
             (&shadow.solid, None, Some(&shadow.group)),
@@ -1503,14 +1602,21 @@ file = \"material.wgsl\"
                     }),
                     ..Default::default()
                 });
-                pass.set_pipeline(layers.solid);
                 pass.set_bind_group(0, &terrain, &[]);
                 pass.set_bind_group(super::super::looks::GROUP, looks, &[]);
                 layers.bind(&mut pass);
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_vertex_buffer(1, origins.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..6, 0, 0..1);
+                // As the world pass draws it: the depth pre-pass, then the shading that tests
+                // equal against it, which must still cover every pixel.
+                let depth_pass = layers
+                    .depth
+                    .expect("the engine's coverage has a depth pre-pass");
+                for pipeline in [depth_pass.solid, layers.solid] {
+                    pass.set_pipeline(pipeline);
+                    pass.draw_indexed(0..6, 0, 0..1);
+                }
             }
             let buffer = crate::gfx::copy_frame(&device, &mut encoder, &target, [4, 4]);
             queue.submit([encoder.finish()]);

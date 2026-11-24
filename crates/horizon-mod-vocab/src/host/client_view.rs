@@ -112,7 +112,7 @@ pub trait ClientViewClientHost {
     /// terrain (the LOD Distance setting) holds it, whether or not the chunk is loaded. It is the finest
     /// far tile sampled there, so a far column is the reduced surface of a cell up to many blocks wide, and
     /// it comes from wherever the far terrain does (this world's generator, the server's offer, the chunks
-    /// kept from earlier visits, a server's BlueMap). None for a column no tile covers yet, and for every
+    /// kept from earlier visits). None for a column no tile covers yet, and for every
     /// column while far terrain is off or not started; the tiles follow the camera, so a column far from it
     /// can go back to None. Inside the loaded chunks read them instead (`client_surface_heights`): a tile can
     /// lag an edit. `Err`, reading nothing, for no client world (the title screen) or more than 65,536
@@ -122,6 +122,20 @@ pub trait ClientViewClientHost {
         &self,
         columns: &[(i32, i32)],
     ) -> Result<Vec<Option<TerrainColumn>>, String>;
+    /// Side: client.
+    /// Read the CPU footprints of exact far-terrain tiles by `(tile_x, tile_z, level)`.
+    /// A tile's world origin is `(tile_x, tile_z) * (16 << level)`; each response
+    /// corresponds to one input. `None` means that exact tile is unavailable
+    /// or far terrain is off, not that its cells are empty. A ready tile still
+    /// covers the terrain the renderer keeps, which can lag live chunk edits.
+    /// It does not generate, request, or load anything and never substitutes
+    /// another level. Returns `Err` before reading if there is no client
+    /// world or more than 256 tiles (65,536 cells) were requested.
+    #[access(WorldOnly)]
+    fn client_lod_columns(
+        &self,
+        tiles: &[(i32, i32, u8)],
+    ) -> Result<Vec<Option<LodTileFootprint>>, String>;
     /// Side: client.
     /// Points the view at `entity` (`Minecraft.setCameraEntity`), as a server's camera packet
     /// does; the local player's own ref puts it back. True when the view now follows it; false,

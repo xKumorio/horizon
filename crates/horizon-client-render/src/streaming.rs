@@ -203,13 +203,6 @@ pub trait LodSampler: Send {
     fn reduced_column(&mut self, x: i32, z: i32, _width: i32) -> crate::lod::Column {
         self.column(x, z)
     }
-    /// Whether a column since the last call was left empty because its data
-    /// is still on its way (a BlueMap tile downloading, nothing coarser to
-    /// stand in): that sample isn't drawn, what it would replace is
-    /// (`Lod::finish_any_sample`), and it is taken again later.
-    fn waited(&mut self) -> bool {
-        false
-    }
     /// `side` x `side` columns from (`x`, `z`), `stride` blocks apart; none
     /// when sampling failed and should be tried again later.
     fn grid(&mut self, x: i32, z: i32, stride: i32, side: usize) -> Vec<crate::lod::Column> {
@@ -288,6 +281,7 @@ struct MeshSettings {
     cutout_leaves: bool,
     opaque_ice: bool,
     translucent_layers: Arc<[bool]>,
+    block_layers: Arc<crate::mesher::BlockLayerTable>,
     leaf_culling: LeafCullingMode,
 }
 enum Job {
@@ -708,6 +702,8 @@ pub struct Streaming {
     /// Sprite layers a shader pack draws in the translucent pass (`[[materials]]
     /// translucent`), by layer; empty without one.
     pub translucent_layers: Arc<[bool]>,
+    /// Per-state shader-pack model/fluid layer overrides; empty without a pack.
+    pub block_layers: Arc<crate::mesher::BlockLayerTable>,
     /// What the mesher does with leaf faces inside a canopy (`LeafCullingMode`).
     pub leaf_culling: LeafCullingMode,
     /// Incremental relighting of block edits on lit chunks (see `light::relight`).
@@ -751,6 +747,8 @@ pub struct Streaming {
     /// Cached face visibility and scratch buffers for synchronous edit meshing (`mesh_immediate`).
     immediate_faces: Faces,
     immediate_scratch: MeshScratch,
+    /// Frames left before nearby sections are meshed synchronously again (`NEARBY_COOLDOWN_FRAMES`).
+    nearby_cooldown: immediate_mesh::NearbyCooldown,
 }
 /// Snapshot only after a scan found no missing candidates. Public range fields
 /// and `World::chunks` can change without going through Streaming, so compare
@@ -1315,6 +1313,7 @@ impl Streaming {
             cutout_leaves: true,
             opaque_ice: false,
             translucent_layers: Arc::from([]),
+            block_layers: Arc::default(),
             leaf_culling: LeafCullingMode::Off,
             light_tables,
             light_log: Vec::new(),
@@ -1333,6 +1332,7 @@ impl Streaming {
             band_ranked: None,
             immediate_faces: None,
             immediate_scratch: MeshScratch::default(),
+            nearby_cooldown: Default::default(),
         }
     }
     /// Shares generation resources, but gives distant work its own worker state.
@@ -2774,6 +2774,18 @@ impl Streaming {
             }
         }
     }
+    /// Make a column resident for an immediate read.
+    /// The temporary request serves the same purpose as `ServerChunkCache.getChunk(FULL)`.
+    pub fn load_full_chunk(&mut self, world: &mut World, key: (i32, i32)) {
+        if world.chunks.contains_key(&key) {
+            return;
+        }
+        self.rank_full_task(key.0, key.1);
+        // Full columns finish out to radius + 1. This request is for one column.
+        self.extra.push((key, -1));
+        self.wait_for_full_chunk(world, key);
+        self.extra.pop();
+    }
     pub fn band(&self) -> Option<Band> {
         self.band
     }
@@ -2789,29 +2801,34 @@ impl Streaming {
     pub fn set_forced_loaded(&mut self, world: &mut World, x: i32, z: i32, forced: bool) -> bool {
         let changed = self.set_forced(x, z, forced);
         if forced && changed {
-            while !world.chunks.contains_key(&(x, z)) {
-                assert!(!self.paused, "forced chunk load before streaming started");
-                assert!(
-                    !self
-                        .shared
-                        .aborted
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    "forced chunk load after generation stopped"
-                );
-                // Pump the existing generation queue. Keep unloads for the
-                // normal owner update, which saves entities and notifies mods.
-                let mut plan = self.plan_update(world);
-                plan.sweep = false;
-                plan.far.clear();
-                let (meshes, unloaded) = self.finish_update(world, plan);
-                debug_assert!(unloaded.is_empty());
-                self.free(meshes);
-                if !world.chunks.contains_key(&(x, z)) {
-                    self.wait(std::time::Duration::from_millis(5));
-                }
-            }
+            self.wait_for_full_chunk(world, (x, z));
         }
         changed
+    }
+
+    /// Pump Horizon's generation and disk reads for a requested column.
+    fn wait_for_full_chunk(&mut self, world: &mut World, key: (i32, i32)) {
+        while !world.chunks.contains_key(&key) {
+            assert!(!self.paused, "chunk load before streaming started");
+            assert!(
+                !self
+                    .shared
+                    .aborted
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "chunk load after generation stopped"
+            );
+            // Pump the existing generation queue. Keep unloads for the
+            // normal owner update, which saves entities and notifies mods.
+            let mut plan = self.plan_update(world);
+            plan.sweep = false;
+            plan.far.clear();
+            let (meshes, unloaded) = self.finish_update(world, plan);
+            debug_assert!(unloaded.is_empty());
+            self.free(meshes);
+            if !world.chunks.contains_key(&key) {
+                self.wait(std::time::Duration::from_millis(5));
+            }
+        }
     }
 
     /// Release every `/forceload`ed chunk (`/forceload remove all`, a game-test
@@ -2857,6 +2874,24 @@ impl Streaming {
             self.mod_tickets.insert(ticket)
         } else {
             self.mod_tickets.remove(&ticket)
+        };
+        if self.settle(chunk) {
+            self.rank_forced(chunk.0, chunk.1, chunk.0, chunk.1);
+        }
+        changed
+    }
+    /// Hold or release a runtime-only mod ticket ([`TransientTicket`]), as
+    /// [`Self::set_mod_forced`] does a saved one: true when it changed.
+    pub fn set_transient_forced(
+        &mut self,
+        ticket: crate::mod_chunk_tickets::TransientTicket,
+        forced: bool,
+    ) -> bool {
+        let chunk = ticket.chunk;
+        let changed = if forced {
+            self.mod_tickets.insert_transient(ticket)
+        } else {
+            self.mod_tickets.remove_transient(&ticket)
         };
         if self.settle(chunk) {
             self.rank_forced(chunk.0, chunk.1, chunk.0, chunk.1);
@@ -3005,11 +3040,22 @@ impl ViewArrival {
         if self.since.is_none() || view != self.view {
             (self.view, self.since, self.arrived) = (view, Some(now), false);
         }
-        let ((x, z), r) = view;
-        if self.arrived || r < 0 || !self.recent(now) {
+        if self.arrived || view.1 < 0 || !self.recent(now) {
             return false;
         }
-        self.arrived = (-r..=r).all(|d| {
+        let incomplete = self.arrival_incomplete(has);
+        self.arrived = !incomplete;
+        incomplete
+    }
+
+    /// Whether the tracked view still lacks a perimeter column, even after
+    /// the UI stopped waiting or a level change cleared the columns.
+    pub fn arrival_incomplete(&self, has: impl Fn((i32, i32)) -> bool) -> bool {
+        let ((x, z), r) = self.view;
+        if self.since.is_none() || r < 0 {
+            return false;
+        }
+        !(-r..=r).all(|d| {
             // How far row (and column) `d` reaches: `in_view_distance` solved for it.
             let gap = i64::from((d.abs() - 1).max(0));
             let room = i64::from(r).pow(2) - gap * gap;
@@ -3020,8 +3066,7 @@ impl ViewArrival {
                     .into_iter()
                     .all(|e| has((x + d, z + e)) && has((x + e, z + d)))
             }
-        });
-        !self.arrived
+        })
     }
     /// Whether the view `arriving` was last given changed less than `VIEW_WAIT`
     /// ago: until then sections meshed are its terrain coming in, later an edit's.
@@ -4441,6 +4486,7 @@ mod tests {
             cutout_leaves: true,
             opaque_ice: false,
             translucent_layers: Arc::from([]),
+            block_layers: Arc::default(),
             leaf_culling: LeafCullingMode::Off,
         };
         let mut meshed = FxHashSet::default();

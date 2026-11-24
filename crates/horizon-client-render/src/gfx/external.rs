@@ -57,6 +57,11 @@ pub trait ExternalPipeline: Send + std::any::Any {
     }
     /// It stops with nothing in its place: what it kept from frame to frame goes now.
     fn retire(&mut self, _device: &wgpu::Device) {}
+    /// The tilt in degrees of the sun's and moon's path (`[sky] sun_path_rotation`), which turns
+    /// the sun, moon and stars the engine draws; none under the End sky.
+    fn sun_path_rotation(&self) -> f32 {
+        0.0
+    }
     /// Every section is gone (a new world, a new dimension).
     fn world_cleared(&mut self) {}
     /// Forget what was kept from earlier frames: the next is drawn as a fresh pipeline's first.
@@ -128,7 +133,11 @@ pub trait ExternalPipeline: Send + std::any::Any {
     /// Its grid of the solid terrain near the camera, drawn by `layers`' displaced layer, in a
     /// terrain pass with the engine's group 0 bound.
     fn draw_displaced(&self, _pass: &mut wgpu::RenderPass<'_>, _layers: TerrainLayers<'_>) {}
-    /// Where the world pass stops before translucent terrain, for layers that read it.
+    /// Whether the pipeline reads a copy of the world before translucent terrain.
+    fn reads_opaque(&self) -> bool {
+        false
+    }
+    /// Where the world pass stops before translucent terrain, for stages that read it.
     fn copy_opaque(&self, _copy: OpaqueCopy<'_>) {}
     /// Its rain and snow. False when it has none, for the engine's own.
     fn draw_weather(
@@ -335,6 +344,10 @@ pub struct TerrainLayers<'a> {
     pub displaced: Option<&'a wgpu::RenderPipeline>,
     /// The solid layers for 4x MSAA (instanced, then flat draws), when the pack's material got them.
     pub msaa: Option<&'a (wgpu::RenderPipeline, Option<wgpu::RenderPipeline>)>,
+    /// The solid layers' depth pre-pass (instanced, then flat draws), and 4x MSAA's, where they
+    /// have one: drawn over the same draws before each solid layer, which then tests depth
+    /// equal to it and doesn't write it.
+    pub depth: Option<SolidDepth<'a>>,
     /// The solid layers' second target, which they write beside the world's colour.
     pub surface: Option<&'a wgpu::TextureView>,
     /// The layers read the world before translucent terrain: the renderer stops there for
@@ -342,6 +355,14 @@ pub struct TerrainLayers<'a> {
     pub reads_opaque: bool,
     /// What the layers read beside the terrain's groups (`bind`).
     pub frame: &'a wgpu::BindGroup,
+}
+
+/// `TerrainLayers::depth`.
+#[derive(Clone, Copy)]
+pub struct SolidDepth<'a> {
+    pub solid: &'a wgpu::RenderPipeline,
+    pub flat: Option<&'a wgpu::RenderPipeline>,
+    pub msaa: Option<&'a (wgpu::RenderPipeline, Option<wgpu::RenderPipeline>)>,
 }
 
 impl TerrainLayers<'_> {

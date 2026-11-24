@@ -6,9 +6,11 @@ pub(crate) mod block_state_definition;
 pub mod camera;
 pub(crate) mod client_reload;
 pub(crate) mod client_session;
+pub(crate) mod closing_save;
 pub(crate) mod debug_entries;
 pub(crate) mod entity_layers;
 pub(crate) mod entity_renderers;
+pub(crate) mod export;
 // hidden: a module of game-side types; mods use their re-exports
 #[doc(hidden)]
 pub mod extras;

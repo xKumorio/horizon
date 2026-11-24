@@ -38,14 +38,9 @@ impl Game<'_> {
         let Some(r) = self.remote.as_mut() else {
             return;
         };
-        if section_ready && r.level_load.wants_player_section() {
-            r.level_load.player_section_ready();
-        }
-        r.level_load.tick_client_load(now, check);
-        if !r.level_load.is_level_ready(now) {
+        if !r.level_load.poll_client_load(now, section_ready, check) {
             return;
         }
-        r.level_load.finish();
         if !r.loaded_sent {
             r.loaded_sent = true;
             self.send(S::PlayerLoaded(Empty));
@@ -363,6 +358,16 @@ impl Game<'_> {
                 // frostbite overlay shows it (#8156).
                 passenger.passenger_block_effects_tick()?;
             }
+        }
+        // Player.tick holds the player at the world's edge after the move: X
+        // and Z clamp, Y does not (Player.java:264-265). A passenger is left
+        // alone: Entity.rideTick runs Player.tick and only then seats the rider
+        // on the vehicle (`Entity.java:2433-2439`), so the seat's position is
+        // what survives the tick, and clamping here would pull a rider off a
+        // seat that legally sits past the edge.
+        if !riding {
+            player.position.x = player.position.x.clamp(-2.9999999E7, 2.9999999E7);
+            player.position.z = player.position.z.clamp(-2.9999999E7, 2.9999999E7);
         }
         // The server decides fire the window cannot predict (blaze fireballs,
         // fire aspect, lightning): Entity.isOnFire reads the synched flag, so
